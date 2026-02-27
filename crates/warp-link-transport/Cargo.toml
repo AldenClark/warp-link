@@ -1,0 +1,27 @@
+[package]
+name = "warp-link-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["quic", "tcp", "wss"]
+quic = []
+tcp = []
+wss = []
+
+[dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+warp-link-core = { path = "../warp-link-core" }
+webpki-roots = { workspace = true }
+hex = { workspace = true }

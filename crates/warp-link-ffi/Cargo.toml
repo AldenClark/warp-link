@@ -1,0 +1,27 @@
+[package]
+name = "warp-link-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "warp_link_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = ["quic", "tcp", "wss"]
+quic = ["warp-link/quic"]
+tcp = ["warp-link/tcp"]
+wss = ["warp-link/wss"]
+
+[dependencies]
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+postcard = { workspace = true }
+flume = { workspace = true }
+warp-link = { path = "../warp-link", default-features = false }
+warp-link-core = { path = "../warp-link-core" }
+pushgo-warp-profile = { path = "../pushgo-warp-profile" }

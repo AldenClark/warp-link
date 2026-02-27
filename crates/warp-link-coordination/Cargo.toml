@@ -1,0 +1,14 @@
+[package]
+name = "warp-link-coordination"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+warp-link-core = { path = "../warp-link-core" }
+
+[dev-dependencies]
+tokio = { workspace = true }
