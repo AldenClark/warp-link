@@ -31,6 +31,11 @@ pub struct ClientPolicy {
     pub write_timeout_ms: u64,
     pub backoff_min_ms: u64,
     pub backoff_max_ms: u64,
+    pub upgrade_probe_enabled: bool,
+    pub upgrade_probe_timeout_ms: u64,
+    pub upgrade_probe_foreground_interval_secs: u16,
+    pub upgrade_probe_background_interval_secs: u16,
+    pub upgrade_probe_min_dwell_secs: u16,
     pub power: ClientPowerPolicy,
 }
 
@@ -44,6 +49,11 @@ impl Default for ClientPolicy {
             write_timeout_ms: 5_000,
             backoff_min_ms: 2_000,
             backoff_max_ms: 60_000,
+            upgrade_probe_enabled: true,
+            upgrade_probe_timeout_ms: 2_000,
+            upgrade_probe_foreground_interval_secs: 45,
+            upgrade_probe_background_interval_secs: 180,
+            upgrade_probe_min_dwell_secs: 20,
             power: ClientPowerPolicy::default(),
         }
     }

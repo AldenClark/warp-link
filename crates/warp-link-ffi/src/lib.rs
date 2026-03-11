@@ -80,6 +80,16 @@ struct PolicyConfig {
     backoff_min_ms: Option<u64>,
     #[serde(default)]
     backoff_max_ms: Option<u64>,
+    #[serde(default)]
+    upgrade_probe_enabled: Option<bool>,
+    #[serde(default)]
+    upgrade_probe_timeout_ms: Option<u64>,
+    #[serde(default)]
+    upgrade_probe_foreground_interval_secs: Option<u16>,
+    #[serde(default)]
+    upgrade_probe_background_interval_secs: Option<u16>,
+    #[serde(default)]
+    upgrade_probe_min_dwell_secs: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -356,6 +366,21 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
         }
         if let Some(value) = custom.backoff_max_ms {
             policy.backoff_max_ms = value;
+        }
+        if let Some(value) = custom.upgrade_probe_enabled {
+            policy.upgrade_probe_enabled = value;
+        }
+        if let Some(value) = custom.upgrade_probe_timeout_ms {
+            policy.upgrade_probe_timeout_ms = value;
+        }
+        if let Some(value) = custom.upgrade_probe_foreground_interval_secs {
+            policy.upgrade_probe_foreground_interval_secs = value;
+        }
+        if let Some(value) = custom.upgrade_probe_background_interval_secs {
+            policy.upgrade_probe_background_interval_secs = value;
+        }
+        if let Some(value) = custom.upgrade_probe_min_dwell_secs {
+            policy.upgrade_probe_min_dwell_secs = value;
         }
     }
 

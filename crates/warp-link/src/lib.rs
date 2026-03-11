@@ -63,6 +63,42 @@ pub use warp_link_transport;
 
 const TRANSPORT_MAX_FRAME_BYTES: u32 = ((32 * 1024) + 2) as u32;
 
+#[derive(Default)]
+struct ClientContinuityState {
+    resume_token: Option<String>,
+    last_acked_seq: Option<u64>,
+}
+
+impl ClientContinuityState {
+    fn apply_to_hello(&self, hello: &mut HelloCtx) {
+        if let Some(resume_token) = self.resume_token.as_ref() {
+            hello.resume_token = Some(resume_token.clone());
+        }
+        if let Some(seq) = self.last_acked_seq {
+            hello.last_acked_seq = Some(hello.last_acked_seq.unwrap_or(seq).max(seq));
+        }
+    }
+
+    fn note_welcome(&mut self, resume_token: Option<&str>) {
+        if let Some(value) = resume_token
+            && !value.trim().is_empty()
+        {
+            self.resume_token = Some(value.to_string());
+        }
+    }
+
+    fn note_acked_seq(&mut self, seq: Option<u64>) {
+        let Some(seq) = seq else {
+            return;
+        };
+        self.last_acked_seq = Some(self.last_acked_seq.unwrap_or(seq).max(seq));
+    }
+
+    fn can_switch_without_loss(&self) -> bool {
+        self.resume_token.is_some()
+    }
+}
+
 pub async fn client_run(config: ClientConfig, app: impl ClientApp) -> Result<(), WarpLinkError> {
     let (_tx, rx) = watch::channel(false);
     client_run_with_shutdown(config, app, rx).await
@@ -72,7 +108,8 @@ pub async fn client_run_once(
     config: &ClientConfig,
     app: Arc<dyn ClientApp>,
 ) -> Result<(), WarpLinkError> {
-    run_client_session_once(config, app).await
+    let mut continuity = ClientContinuityState::default();
+    run_client_session_once(config, app, &mut continuity).await
 }
 
 pub async fn client_run_with_shutdown(
@@ -82,11 +119,12 @@ pub async fn client_run_with_shutdown(
 ) -> Result<(), WarpLinkError> {
     let app: Arc<dyn ClientApp> = Arc::new(app);
     let mut attempt: u32 = 0;
+    let mut continuity = ClientContinuityState::default();
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
-        match run_client_session_once(&config, Arc::clone(&app)).await {
+        match run_client_session_once(&config, Arc::clone(&app), &mut continuity).await {
             Ok(()) => {
                 attempt = 0;
             }
@@ -128,12 +166,14 @@ pub async fn client_run_with_shutdown(
 async fn run_client_session_once(
     config: &ClientConfig,
     app: Arc<dyn ClientApp>,
+    continuity: &mut ClientContinuityState,
 ) -> Result<(), WarpLinkError> {
     let (transport, mut io) = hedged_connect(config).await?;
     let _ = app.on_event(ClientEvent::Connected { transport });
 
     let mut power_runtime = ClientPowerRuntime::new(Instant::now());
-    let hello = build_effective_hello(config, app.as_ref(), &mut power_runtime);
+    let mut hello = build_effective_hello(config, app.as_ref(), &mut power_runtime);
+    continuity.apply_to_hello(&mut hello);
     let hello_frame = config.wire_profile.encode_client_hello(&hello)?;
     io.send_frame(&hello_frame, config.policy.write_timeout_ms)
         .await?;
@@ -156,9 +196,13 @@ async fn run_client_session_once(
     let _ = app.on_event(ClientEvent::Welcome {
         welcome: welcome.clone(),
     });
+    continuity.note_welcome(welcome.resume_token.as_deref());
 
     let idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
     let mut idle_timeout_streak = 0u8;
+    let mut last_idle_ping_at = Instant::now();
+    let mut upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
+    upgrade_probe_runtime.schedule_next(config, app.as_ref(), &power_runtime, Instant::now());
 
     loop {
         maybe_send_inband_hello_update(
@@ -167,24 +211,62 @@ async fn run_client_session_once(
             &mut io,
             &mut inband_hello_snapshot,
             &mut power_runtime,
+            continuity,
         )
         .await?;
-        let frame = match io.recv_frame(idle_timeout_ms).await {
+        let now = Instant::now();
+        let recv_timeout_ms = next_recv_timeout_ms(config, &upgrade_probe_runtime, now)
+            .unwrap_or(idle_timeout_ms)
+            .min(idle_timeout_ms)
+            .max(1);
+        let frame = match io.recv_frame(recv_timeout_ms).await {
             Ok(frame) => {
                 idle_timeout_streak = 0;
+                last_idle_ping_at = Instant::now();
                 frame
             }
             Err(WarpLinkError::Timeout(_)) => {
-                idle_timeout_streak = idle_timeout_streak.saturating_add(1);
-                if idle_timeout_streak >= 4 {
-                    let _ = app.on_event(ClientEvent::Disconnected {
-                        transport,
-                        reason: "idle timeout".to_string(),
-                    });
-                    return Err(WarpLinkError::Timeout("idle timeout".to_string()));
+                let now = Instant::now();
+                if upgrade_probe_runtime.should_probe(config, now) {
+                    if continuity.can_switch_without_loss() {
+                        if let Some(target) =
+                            probe_higher_priority_transport(config, transport).await
+                        {
+                            let reason = format!("transport_upgrade:{transport}->{target}");
+                            let _ = app.on_event(ClientEvent::Disconnected { transport, reason });
+                            return Ok(());
+                        }
+                        upgrade_probe_runtime.note_probe_failure(
+                            config,
+                            app.as_ref(),
+                            &power_runtime,
+                            now,
+                        );
+                    } else {
+                        upgrade_probe_runtime.note_probe_skip(
+                            config,
+                            app.as_ref(),
+                            &power_runtime,
+                            now,
+                        );
+                    }
                 }
-                let ping = config.wire_profile.encode_client_ping();
-                io.send_frame(&ping, config.policy.write_timeout_ms).await?;
+
+                if now.saturating_duration_since(last_idle_ping_at)
+                    >= Duration::from_millis(idle_timeout_ms)
+                {
+                    idle_timeout_streak = idle_timeout_streak.saturating_add(1);
+                    if idle_timeout_streak >= 4 {
+                        let _ = app.on_event(ClientEvent::Disconnected {
+                            transport,
+                            reason: "idle timeout".to_string(),
+                        });
+                        return Err(WarpLinkError::Timeout("idle timeout".to_string()));
+                    }
+                    let ping = config.wire_profile.encode_client_ping();
+                    io.send_frame(&ping, config.policy.write_timeout_ms).await?;
+                    last_idle_ping_at = now;
+                }
                 continue;
             }
             Err(err) => {
@@ -217,6 +299,7 @@ async fn run_client_session_once(
                     let bytes = config.wire_profile.encode_client_ack(&ack)?;
                     io.send_frame(&bytes, config.policy.write_timeout_ms)
                         .await?;
+                    continuity.note_acked_seq(msg.seq);
                 }
             }
             DecodedServerFrame::Ping => {
@@ -278,6 +361,20 @@ impl ClientPowerRuntime {
         }
     }
 
+    fn current_auto_state(&self, policy: &ClientPowerPolicy, now: Instant) -> ClientAppStateHint {
+        if !policy.auto_enabled {
+            return ClientAppStateHint::Foreground;
+        }
+        let idle_for = now.saturating_duration_since(self.last_message_at);
+        let idle_secs = idle_for.as_secs();
+        let idle_cutoff = u64::from(policy.idle_to_low_after_secs);
+        if idle_cutoff > 0 && idle_secs >= idle_cutoff {
+            ClientAppStateHint::Background
+        } else {
+            ClientAppStateHint::Foreground
+        }
+    }
+
     fn select_auto(
         &mut self,
         policy: &ClientPowerPolicy,
@@ -322,6 +419,79 @@ impl ClientPowerRuntime {
 
     fn mark_power_update(&mut self, now: Instant) {
         self.last_power_push_at = Some(now);
+    }
+}
+
+struct UpgradeProbeRuntime {
+    transport: TransportKind,
+    connected_at: Instant,
+    next_probe_at: Option<Instant>,
+    probe_failure_streak: u8,
+}
+
+impl UpgradeProbeRuntime {
+    fn new(transport: TransportKind, now: Instant) -> Self {
+        Self {
+            transport,
+            connected_at: now,
+            next_probe_at: None,
+            probe_failure_streak: 0,
+        }
+    }
+
+    fn should_probe(&self, config: &ClientConfig, now: Instant) -> bool {
+        let Some(next_probe_at) = self.next_probe_at else {
+            return false;
+        };
+        if !config.policy.upgrade_probe_enabled || !has_higher_priority_transport(self.transport) {
+            return false;
+        }
+        let dwell = Duration::from_secs(u64::from(config.policy.upgrade_probe_min_dwell_secs));
+        if now.saturating_duration_since(self.connected_at) < dwell {
+            return false;
+        }
+        now >= next_probe_at
+    }
+
+    fn schedule_next(
+        &mut self,
+        config: &ClientConfig,
+        app: &dyn ClientApp,
+        power_runtime: &ClientPowerRuntime,
+        now: Instant,
+    ) {
+        if !config.policy.upgrade_probe_enabled || !has_higher_priority_transport(self.transport) {
+            self.next_probe_at = None;
+            return;
+        }
+        let base = upgrade_probe_interval(config, app, power_runtime, now);
+        let exp = u32::from(self.probe_failure_streak.min(6));
+        let mut interval = base.saturating_mul(1u32 << exp);
+        let jitter_span = duration_ms(base / 4).max(1);
+        let jitter = rand::rng().random_range(0..=jitter_span);
+        interval = interval.saturating_add(Duration::from_millis(jitter));
+        self.next_probe_at = Some(now + interval);
+    }
+
+    fn note_probe_failure(
+        &mut self,
+        config: &ClientConfig,
+        app: &dyn ClientApp,
+        power_runtime: &ClientPowerRuntime,
+        now: Instant,
+    ) {
+        self.probe_failure_streak = self.probe_failure_streak.saturating_add(1);
+        self.schedule_next(config, app, power_runtime, now);
+    }
+
+    fn note_probe_skip(
+        &mut self,
+        config: &ClientConfig,
+        app: &dyn ClientApp,
+        power_runtime: &ClientPowerRuntime,
+        now: Instant,
+    ) {
+        self.schedule_next(config, app, power_runtime, now);
     }
 }
 
@@ -396,8 +566,10 @@ async fn maybe_send_inband_hello_update(
     io: &mut ClientIo,
     snapshot: &mut HelloCtx,
     power_runtime: &mut ClientPowerRuntime,
+    continuity: &ClientContinuityState,
 ) -> Result<(), WarpLinkError> {
-    let latest = build_effective_hello(config, app, power_runtime);
+    let mut latest = build_effective_hello(config, app, power_runtime);
+    continuity.apply_to_hello(&mut latest);
     if latest.identity != snapshot.identity {
         return Ok(());
     }
@@ -417,6 +589,102 @@ async fn maybe_send_inband_hello_update(
         .await?;
     *snapshot = latest;
     Ok(())
+}
+
+fn next_recv_timeout_ms(
+    config: &ClientConfig,
+    probe_runtime: &UpgradeProbeRuntime,
+    now: Instant,
+) -> Option<u64> {
+    let next_probe_at = probe_runtime.next_probe_at?;
+    if !config.policy.upgrade_probe_enabled
+        || !has_higher_priority_transport(probe_runtime.transport)
+    {
+        return None;
+    }
+    let dwell = Duration::from_secs(u64::from(config.policy.upgrade_probe_min_dwell_secs));
+    let earliest_probe_at = probe_runtime.connected_at + dwell;
+    let effective_probe_at = next_probe_at.max(earliest_probe_at);
+    if effective_probe_at <= now {
+        return Some(1);
+    }
+    let remaining = effective_probe_at.saturating_duration_since(now);
+    Some(duration_ms(remaining))
+}
+
+fn duration_ms(value: Duration) -> u64 {
+    value.as_millis().try_into().unwrap_or(u64::MAX).max(1)
+}
+
+fn upgrade_probe_interval(
+    config: &ClientConfig,
+    app: &dyn ClientApp,
+    power_runtime: &ClientPowerRuntime,
+    now: Instant,
+) -> Duration {
+    let app_state = app
+        .power_hint()
+        .map(|value| value.app_state)
+        .unwrap_or_else(|| power_runtime.current_auto_state(&config.policy.power, now));
+    let secs = match app_state {
+        ClientAppStateHint::Foreground => config.policy.upgrade_probe_foreground_interval_secs,
+        ClientAppStateHint::Background => config.policy.upgrade_probe_background_interval_secs,
+    };
+    Duration::from_secs(u64::from(secs.max(1)))
+}
+
+fn has_higher_priority_transport(transport: TransportKind) -> bool {
+    !matches!(transport, TransportKind::Quic)
+}
+
+async fn probe_higher_priority_transport(
+    config: &ClientConfig,
+    current: TransportKind,
+) -> Option<TransportKind> {
+    let mut attempts = JoinSet::new();
+
+    #[cfg(feature = "quic")]
+    if matches!(current, TransportKind::Wss | TransportKind::Tcp) {
+        let quic_cfg = config.clone();
+        attempts.spawn(async move { (TransportKind::Quic, connect_quic(&quic_cfg).await) });
+    }
+
+    #[cfg(feature = "tcp")]
+    if current == TransportKind::Wss {
+        let tcp_cfg = config.clone();
+        attempts.spawn(async move { (TransportKind::Tcp, connect_tcp(&tcp_cfg).await) });
+    }
+
+    if attempts.is_empty() {
+        return None;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(config.policy.upgrade_probe_timeout_ms);
+    while !attempts.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remain = deadline.saturating_duration_since(now);
+        let join = match timeout(remain, attempts.join_next()).await {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(result) = join else {
+            break;
+        };
+        let Ok((transport, io_result)) = result else {
+            continue;
+        };
+        if let Ok(io) = io_result {
+            drop(io);
+            attempts.abort_all();
+            return Some(transport);
+        }
+    }
+
+    attempts.abort_all();
+    None
 }
 
 async fn hedged_connect(config: &ClientConfig) -> Result<(TransportKind, ClientIo), WarpLinkError> {
@@ -2946,5 +3214,65 @@ mod tests {
         let hello = build_effective_hello(&config, &app, &mut runtime);
         assert_eq!(hello.app_state.as_deref(), Some("foreground"));
         assert_eq!(hello.perf_tier.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn upgrade_probe_backoff_is_exponential() {
+        let config = test_client_config();
+        let app = MockClientPowerApp::new(HelloCtx {
+            identity: "dev-1".to_string(),
+            ..HelloCtx::default()
+        });
+        let now = Instant::now();
+        let power_runtime = ClientPowerRuntime::new(now);
+        let base = upgrade_probe_interval(&config, &app, &power_runtime, now);
+        let jitter_cap = base / 4;
+
+        let mut probe = UpgradeProbeRuntime::new(TransportKind::Wss, now - Duration::from_secs(60));
+        probe.note_probe_failure(&config, &app, &power_runtime, now);
+        let first = probe
+            .next_probe_at
+            .expect("first probe deadline should be scheduled")
+            .saturating_duration_since(now);
+        assert!(
+            first >= base.saturating_mul(2),
+            "first failure should at least double base interval"
+        );
+        assert!(
+            first <= base.saturating_mul(2).saturating_add(jitter_cap),
+            "first failure jitter should stay bounded"
+        );
+
+        probe.note_probe_failure(&config, &app, &power_runtime, now);
+        let second = probe
+            .next_probe_at
+            .expect("second probe deadline should be scheduled")
+            .saturating_duration_since(now);
+        assert!(
+            second >= base.saturating_mul(4),
+            "second failure should at least quadruple base interval"
+        );
+        assert!(
+            second <= base.saturating_mul(4).saturating_add(jitter_cap),
+            "second failure jitter should stay bounded"
+        );
+    }
+
+    #[test]
+    fn client_continuity_applies_resume_and_ack_seq() {
+        let mut continuity = ClientContinuityState::default();
+        continuity.note_welcome(Some("resume-1"));
+        continuity.note_acked_seq(Some(42));
+
+        let mut hello = HelloCtx {
+            identity: "dev-1".to_string(),
+            last_acked_seq: Some(10),
+            ..HelloCtx::default()
+        };
+        continuity.apply_to_hello(&mut hello);
+
+        assert_eq!(hello.resume_token.as_deref(), Some("resume-1"));
+        assert_eq!(hello.last_acked_seq, Some(42));
+        assert!(continuity.can_switch_without_loss());
     }
 }
