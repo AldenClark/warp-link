@@ -2022,6 +2022,7 @@ async fn run_standalone_wss_session<S>(
 }
 
 #[cfg(feature = "wss")]
+#[allow(clippy::result_large_err)]
 async fn accept_standalone_wss<S>(
     stream: S,
     expected_path: &str,
@@ -2033,38 +2034,54 @@ where
     let expected = expected_path.to_string();
     let expected_subprotocol = expected_subprotocol.map(|value| value.to_string());
     accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-        if request.uri().path() != expected {
-            let err: WsErrorResponse = WsResponse::builder()
-                .status(WsStatusCode::NOT_FOUND)
-                .body(Some("path_not_found".to_string()))
-                .expect("build wss error response");
-            return Err(err);
-        }
-        let mut response = response;
-        if let Some(expected_subprotocol) = expected_subprotocol.as_deref() {
-            let requested = request
-                .headers()
-                .get("sec-websocket-protocol")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            let matched = requested_subprotocol_matches(requested, expected_subprotocol);
-            if !matched {
-                let err: WsErrorResponse = WsResponse::builder()
-                    .status(WsStatusCode::BAD_REQUEST)
-                    .body(Some("subprotocol_mismatch".to_string()))
-                    .expect("build wss subprotocol error response");
-                return Err(err);
-            }
-            if let Ok(value) = expected_subprotocol.parse() {
-                response
-                    .headers_mut()
-                    .insert("Sec-WebSocket-Protocol", value);
-            }
-        }
-        Ok(response)
+        validate_wss_upgrade_request(
+            request,
+            response,
+            expected.as_str(),
+            expected_subprotocol.as_deref(),
+        )
     })
     .await
     .map_err(|e| WarpLinkError::Protocol(format!("wss upgrade failed: {e}")))
+}
+
+#[cfg(feature = "wss")]
+#[allow(clippy::result_large_err)]
+fn validate_wss_upgrade_request(
+    request: &WsRequest,
+    response: WsResponse,
+    expected_path: &str,
+    expected_subprotocol: Option<&str>,
+) -> Result<WsResponse, WsErrorResponse> {
+    if request.uri().path() != expected_path {
+        let err: WsErrorResponse = WsResponse::builder()
+            .status(WsStatusCode::NOT_FOUND)
+            .body(Some("path_not_found".to_string()))
+            .expect("build wss error response");
+        return Err(err);
+    }
+    let mut response = response;
+    if let Some(expected_subprotocol) = expected_subprotocol {
+        let requested = request
+            .headers()
+            .get("sec-websocket-protocol")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let matched = requested_subprotocol_matches(requested, expected_subprotocol);
+        if !matched {
+            let err: WsErrorResponse = WsResponse::builder()
+                .status(WsStatusCode::BAD_REQUEST)
+                .body(Some("subprotocol_mismatch".to_string()))
+                .expect("build wss subprotocol error response");
+            return Err(err);
+        }
+        if let Ok(value) = expected_subprotocol.parse() {
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", value);
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(feature = "wss")]
