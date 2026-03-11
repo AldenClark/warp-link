@@ -641,7 +641,7 @@ async fn probe_higher_priority_transport(
     config: &ClientConfig,
     current: TransportKind,
 ) -> Option<TransportKind> {
-    let mut attempts = JoinSet::new();
+    let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
 
     #[cfg(feature = "quic")]
     if matches!(current, TransportKind::Wss | TransportKind::Tcp) {
@@ -676,8 +676,7 @@ async fn probe_higher_priority_transport(
         let Ok((transport, io_result)) = result else {
             continue;
         };
-        if let Ok(io) = io_result {
-            drop(io);
+        if io_result.is_ok() {
             attempts.abort_all();
             return Some(transport);
         }
@@ -2022,7 +2021,10 @@ async fn run_standalone_wss_session<S>(
 }
 
 #[cfg(feature = "wss")]
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "tokio-tungstenite callback signature requires WsErrorResponse as Err"
+)]
 async fn accept_standalone_wss<S>(
     stream: S,
     expected_path: &str,
@@ -2034,33 +2036,35 @@ where
     let expected = expected_path.to_string();
     let expected_subprotocol = expected_subprotocol.map(|value| value.to_string());
     accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-        validate_wss_upgrade_request(
+        let mut response = response;
+        if let Some(err) = validate_wss_upgrade_request(
             request,
-            response,
+            &mut response,
             expected.as_str(),
             expected_subprotocol.as_deref(),
-        )
+        ) {
+            return Err(err);
+        }
+        Ok(response)
     })
     .await
     .map_err(|e| WarpLinkError::Protocol(format!("wss upgrade failed: {e}")))
 }
 
 #[cfg(feature = "wss")]
-#[allow(clippy::result_large_err)]
 fn validate_wss_upgrade_request(
     request: &WsRequest,
-    response: WsResponse,
+    response: &mut WsResponse,
     expected_path: &str,
     expected_subprotocol: Option<&str>,
-) -> Result<WsResponse, WsErrorResponse> {
+) -> Option<WsErrorResponse> {
     if request.uri().path() != expected_path {
-        let err: WsErrorResponse = WsResponse::builder()
+        let err = WsResponse::builder()
             .status(WsStatusCode::NOT_FOUND)
             .body(Some("path_not_found".to_string()))
             .expect("build wss error response");
-        return Err(err);
+        return Some(err);
     }
-    let mut response = response;
     if let Some(expected_subprotocol) = expected_subprotocol {
         let requested = request
             .headers()
@@ -2069,11 +2073,11 @@ fn validate_wss_upgrade_request(
             .unwrap_or_default();
         let matched = requested_subprotocol_matches(requested, expected_subprotocol);
         if !matched {
-            let err: WsErrorResponse = WsResponse::builder()
+            let err = WsResponse::builder()
                 .status(WsStatusCode::BAD_REQUEST)
                 .body(Some("subprotocol_mismatch".to_string()))
                 .expect("build wss subprotocol error response");
-            return Err(err);
+            return Some(err);
         }
         if let Ok(value) = expected_subprotocol.parse() {
             response
@@ -2081,7 +2085,7 @@ fn validate_wss_upgrade_request(
                 .insert("Sec-WebSocket-Protocol", value);
         }
     }
-    Ok(response)
+    None
 }
 
 #[cfg(feature = "wss")]
