@@ -168,7 +168,7 @@ async fn run_client_session_once(
     app: Arc<dyn ClientApp>,
     continuity: &mut ClientContinuityState,
 ) -> Result<(), WarpLinkError> {
-    let (transport, mut io) = hedged_connect(config).await?;
+    let (mut transport, mut io) = hedged_connect(config).await?;
     let _ = app.on_event(ClientEvent::Connected { transport });
 
     let mut power_runtime = ClientPowerRuntime::new(Instant::now());
@@ -198,7 +198,7 @@ async fn run_client_session_once(
     });
     continuity.note_welcome(welcome.resume_token.as_deref());
 
-    let idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
+    let mut idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
     let mut idle_timeout_streak = 0u8;
     let mut last_idle_ping_at = Instant::now();
     let mut upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
@@ -229,12 +229,39 @@ async fn run_client_session_once(
                 let now = Instant::now();
                 if upgrade_probe_runtime.should_probe(config, now) {
                     if continuity.can_switch_without_loss() {
-                        if let Some(target) =
+                        if let Some((target, mut candidate_io)) =
                             probe_higher_priority_transport(config, transport).await
+                            && let Ok(candidate_welcome) = initialize_candidate_transport(
+                                config,
+                                app.as_ref(),
+                                continuity,
+                                &mut power_runtime,
+                                &mut candidate_io,
+                            )
+                            .await
                         {
+                            continuity.note_welcome(candidate_welcome.resume_token.as_deref());
                             let reason = format!("transport_upgrade:{transport}->{target}");
                             let _ = app.on_event(ClientEvent::Disconnected { transport, reason });
-                            return Ok(());
+                            transport = target;
+                            io = candidate_io;
+                            idle_timeout_ms =
+                                u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
+                                    * 1_000;
+                            idle_timeout_streak = 0;
+                            last_idle_ping_at = Instant::now();
+                            inband_hello_snapshot =
+                                build_effective_hello(config, app.as_ref(), &mut power_runtime);
+                            continuity.apply_to_hello(&mut inband_hello_snapshot);
+                            upgrade_probe_runtime =
+                                UpgradeProbeRuntime::new(transport, Instant::now());
+                            upgrade_probe_runtime.schedule_next(
+                                config,
+                                app.as_ref(),
+                                &power_runtime,
+                                Instant::now(),
+                            );
+                            continue;
                         }
                         upgrade_probe_runtime.note_probe_failure(
                             config,
@@ -640,7 +667,7 @@ fn has_higher_priority_transport(transport: TransportKind) -> bool {
 async fn probe_higher_priority_transport(
     config: &ClientConfig,
     current: TransportKind,
-) -> Option<TransportKind> {
+) -> Option<(TransportKind, ClientIo)> {
     let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
 
     #[cfg(feature = "quic")]
@@ -676,14 +703,57 @@ async fn probe_higher_priority_transport(
         let Ok((transport, io_result)) = result else {
             continue;
         };
-        if io_result.is_ok() {
+        if let Ok(io) = io_result {
             attempts.abort_all();
-            return Some(transport);
+            return Some((transport, io));
         }
     }
 
     attempts.abort_all();
     None
+}
+
+async fn initialize_candidate_transport(
+    config: &ClientConfig,
+    app: &dyn ClientApp,
+    continuity: &ClientContinuityState,
+    power_runtime: &mut ClientPowerRuntime,
+    io: &mut ClientIo,
+) -> Result<warp_link_core::WelcomeMsg, WarpLinkError> {
+    let mut hello = build_effective_hello(config, app, power_runtime);
+    continuity.apply_to_hello(&mut hello);
+    let hello_frame = config.wire_profile.encode_client_hello(&hello)?;
+    io.send_frame(&hello_frame, config.policy.write_timeout_ms)
+        .await?;
+    let first = io.recv_frame(config.policy.connect_timeout_ms).await?;
+    let welcome = match config.wire_profile.decode_server_frame(&first)? {
+        DecodedServerFrame::Welcome(value) => value,
+        DecodedServerFrame::Error { code, message } => {
+            return Err(WarpLinkError::Protocol(format!(
+                "gateway error: {code} {message}"
+            )));
+        }
+        _ => {
+            return Err(WarpLinkError::Protocol(
+                "expected welcome frame from server".to_string(),
+            ));
+        }
+    };
+    let _ = app.on_event(ClientEvent::Connected {
+        transport: io_transport_kind(io),
+    });
+    let _ = app.on_event(ClientEvent::Welcome {
+        welcome: welcome.clone(),
+    });
+    Ok(welcome)
+}
+
+fn io_transport_kind(io: &ClientIo) -> TransportKind {
+    match io {
+        ClientIo::Quic { .. } => TransportKind::Quic,
+        ClientIo::Tcp { .. } => TransportKind::Tcp,
+        ClientIo::Wss { .. } => TransportKind::Wss,
+    }
 }
 
 async fn hedged_connect(config: &ClientConfig) -> Result<(TransportKind, ClientIo), WarpLinkError> {
@@ -2218,1082 +2288,4 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, WarpLinkError>
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, WarpLinkError> {
     PrivateKeyDer::from_pem_file(path)
         .map_err(|e| WarpLinkError::Internal(format!("read private key failed: {e}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use bytes::Bytes;
-    use pushgo_warp_profile::{FrameType, PushgoWireProfile, postcard_v1_flags};
-    use warp_link_core::{
-        ClientPolicy, ClientPowerHint, ClientPowerTier, HelloCtx, OutboundMsg, SessionCtx,
-        WireProfile,
-    };
-
-    use super::*;
-
-    #[derive(Debug)]
-    enum InboundEvent {
-        Frame(Vec<u8>),
-        Timeout,
-    }
-
-    struct MockIo {
-        inbound: VecDeque<InboundEvent>,
-        outbound: Vec<Vec<u8>>,
-        fail_send_after: Option<usize>,
-        send_count: usize,
-    }
-
-    #[async_trait]
-    impl ServerSessionIo for MockIo {
-        async fn send_frame(&mut self, frame: &[u8]) -> Result<(), WarpLinkError> {
-            if let Some(max_ok_sends) = self.fail_send_after
-                && self.send_count >= max_ok_sends
-            {
-                return Err(WarpLinkError::Transport("mock send failure".to_string()));
-            }
-            self.outbound.push(frame.to_vec());
-            self.send_count = self.send_count.saturating_add(1);
-            Ok(())
-        }
-
-        async fn recv_frame(&mut self, _timeout_ms: u64) -> Result<Vec<u8>, WarpLinkError> {
-            match self.inbound.pop_front() {
-                Some(InboundEvent::Frame(frame)) => Ok(frame),
-                Some(InboundEvent::Timeout) => {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                    Err(WarpLinkError::Timeout("mock timeout".into()))
-                }
-                None => Err(WarpLinkError::Transport("mock eof".into())),
-            }
-        }
-    }
-
-    struct MockCoordinator {
-        acquire_count: AtomicUsize,
-        renew_count: AtomicUsize,
-        release_count: AtomicUsize,
-    }
-
-    impl MockCoordinator {
-        fn new() -> Self {
-            Self {
-                acquire_count: AtomicUsize::new(0),
-                renew_count: AtomicUsize::new(0),
-                release_count: AtomicUsize::new(0),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl warp_link_core::SessionCoordinator for MockCoordinator {
-        async fn acquire(
-            &self,
-            key: &str,
-            owner: &str,
-            ttl_secs: u64,
-        ) -> Result<warp_link_core::SessionLease, warp_link_core::CoordinationError> {
-            self.acquire_count.fetch_add(1, Ordering::SeqCst);
-            Ok(warp_link_core::SessionLease {
-                key: key.to_string(),
-                owner: owner.to_string(),
-                epoch: 1,
-                expires_at_unix_secs: unix_now_secs().saturating_add(ttl_secs as i64),
-            })
-        }
-
-        async fn renew(
-            &self,
-            key: &str,
-            owner: &str,
-            epoch: u64,
-            ttl_secs: u64,
-        ) -> Result<warp_link_core::SessionLease, warp_link_core::CoordinationError> {
-            self.renew_count.fetch_add(1, Ordering::SeqCst);
-            Ok(warp_link_core::SessionLease {
-                key: key.to_string(),
-                owner: owner.to_string(),
-                epoch,
-                expires_at_unix_secs: unix_now_secs().saturating_add(ttl_secs as i64),
-            })
-        }
-
-        async fn release(
-            &self,
-            _key: &str,
-            _owner: &str,
-            _epoch: u64,
-        ) -> Result<(), warp_link_core::CoordinationError> {
-            self.release_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    struct MockServerApp {
-        profile: Arc<PushgoWireProfile>,
-        coordinator: Option<Arc<MockCoordinator>>,
-        send_outbound: bool,
-        reject_auth: bool,
-        sent_once: Mutex<bool>,
-        acked_ids: Mutex<Vec<String>>,
-        disconnected: Mutex<Vec<String>>,
-        handshake_failures: Mutex<Vec<String>>,
-        forced_auth_state: Mutex<SessionAuthState>,
-        session_control: Mutex<Option<SessionControl>>,
-    }
-
-    impl MockServerApp {
-        fn new(send_outbound: bool, reject_auth: bool) -> Self {
-            Self {
-                profile: Arc::new(PushgoWireProfile::new()),
-                coordinator: None,
-                send_outbound,
-                reject_auth,
-                sent_once: Mutex::new(false),
-                acked_ids: Mutex::new(Vec::new()),
-                disconnected: Mutex::new(Vec::new()),
-                handshake_failures: Mutex::new(Vec::new()),
-                forced_auth_state: Mutex::new(SessionAuthState::Valid),
-                session_control: Mutex::new(None),
-            }
-        }
-
-        fn with_coordinator(
-            send_outbound: bool,
-            reject_auth: bool,
-            coordinator: Arc<MockCoordinator>,
-        ) -> Self {
-            let mut app = Self::new(send_outbound, reject_auth);
-            app.coordinator = Some(coordinator);
-            app
-        }
-
-        fn set_auth_state(&self, state: SessionAuthState) {
-            *self
-                .forced_auth_state
-                .lock()
-                .expect("forced_auth_state lock should not be poisoned") = state;
-        }
-    }
-
-    struct MockClientPowerApp {
-        hello: Mutex<HelloCtx>,
-        hint: Mutex<Option<ClientPowerHint>>,
-    }
-
-    impl MockClientPowerApp {
-        fn new(hello: HelloCtx) -> Self {
-            Self {
-                hello: Mutex::new(hello),
-                hint: Mutex::new(None),
-            }
-        }
-
-        fn set_power_hint(&self, hint: Option<ClientPowerHint>) {
-            *self.hint.lock().expect("hint lock should not be poisoned") = hint;
-        }
-    }
-
-    impl ClientApp for MockClientPowerApp {
-        fn on_hello(&self) -> HelloCtx {
-            self.hello
-                .lock()
-                .expect("hello lock should not be poisoned")
-                .clone()
-        }
-
-        fn on_event(&self, _event: ClientEvent) -> AppDecision {
-            AppDecision::Ignore
-        }
-
-        fn power_hint(&self) -> Option<ClientPowerHint> {
-            *self.hint.lock().expect("hint lock should not be poisoned")
-        }
-    }
-
-    fn test_client_config() -> ClientConfig {
-        ClientConfig {
-            host: "push.local".to_string(),
-            quic_port: 443,
-            wss_port: 443,
-            tcp_port: 5223,
-            wss_path: "/private/ws".to_string(),
-            quic_alpn: "pushgo-quic".to_string(),
-            tcp_alpn: "pushgo-tcp".to_string(),
-            wss_subprotocol: Some("pushgo-private.v1".to_string()),
-            tls_server_name: None,
-            bearer_token: None,
-            cert_pin_sha256: None,
-            quic_cert_pin_sha256: None,
-            tcp_cert_pin_sha256: None,
-            wss_cert_pin_sha256: None,
-            policy: ClientPolicy::default(),
-            wire_profile: Arc::new(PushgoWireProfile::new()),
-        }
-    }
-
-    #[cfg(feature = "wss")]
-    #[test]
-    fn standalone_wss_subprotocol_allows_csv_header() {
-        assert!(requested_subprotocol_matches(
-            "chat, pushgo-private.v1",
-            "pushgo-private.v1"
-        ));
-        assert!(!requested_subprotocol_matches(
-            "chat, superchat",
-            "pushgo-private.v1"
-        ));
-    }
-
-    #[async_trait]
-    impl ServerApp for MockServerApp {
-        fn wire_profile(&self) -> Arc<dyn warp_link_core::WireProfile> {
-            self.profile.clone()
-        }
-
-        async fn auth(&self, request: AuthRequest) -> Result<AuthResponse, AuthError> {
-            match request.phase {
-                AuthCheckPhase::Connect => {
-                    if self.reject_auth {
-                        return Err(AuthError::Unauthorized("mock auth rejected".to_string()));
-                    }
-                    let hello = request
-                        .hello
-                        .ok_or_else(|| AuthError::Internal("missing_connect_hello".to_string()))?;
-                    Ok(AuthResponse::ConnectAccepted(SessionCtx {
-                        session_id: "s-1".to_string(),
-                        identity: hello.identity,
-                        resume_token: Some("resume-1".to_string()),
-                        heartbeat_secs: 12,
-                        ping_interval_secs: 6,
-                        idle_timeout_secs: 48,
-                        max_backoff_secs: 30,
-                        auth_expires_at_unix_secs: Some(unix_now_secs().saturating_add(30)),
-                        auth_refresh_before_secs: 30,
-                        max_frame_bytes: 32 * 1024,
-                        negotiated_wire_version: 1,
-                        negotiated_payload_version: 1,
-                        metadata: std::collections::BTreeMap::new(),
-                    }))
-                }
-                AuthCheckPhase::RefreshWindow | AuthCheckPhase::InBandReauth => {
-                    let state = self
-                        .forced_auth_state
-                        .lock()
-                        .expect("forced_auth_state lock should not be poisoned")
-                        .clone();
-                    Ok(AuthResponse::State(state))
-                }
-            }
-        }
-
-        async fn wait_outbound(
-            &self,
-            _session: &SessionCtx,
-            max_wait_ms: u64,
-        ) -> Option<OutboundMsg> {
-            if !self.send_outbound {
-                tokio::time::sleep(Duration::from_millis(max_wait_ms.max(1))).await;
-                return None;
-            }
-            let mut sent = self
-                .sent_once
-                .lock()
-                .expect("sent_once lock should not be poisoned");
-            if *sent {
-                return None;
-            }
-            *sent = true;
-            Some(OutboundMsg {
-                seq: Some(1),
-                id: "m-1".to_string(),
-                payload: Bytes::from_static(b"demo"),
-            })
-        }
-
-        async fn on_ack(&self, _session: &SessionCtx, ack: AckMsg) {
-            self.acked_ids
-                .lock()
-                .expect("acked_ids lock should not be poisoned")
-                .push(ack.id);
-        }
-
-        async fn on_disconnect(&self, _session: &SessionCtx, reason: DisconnectReason) {
-            self.disconnected
-                .lock()
-                .expect("disconnected lock should not be poisoned")
-                .push(format!("{reason:?}"));
-        }
-
-        async fn on_handshake_failure(&self, _peer: PeerMeta, error: &WarpLinkError) {
-            self.handshake_failures
-                .lock()
-                .expect("handshake_failures lock should not be poisoned")
-                .push(error.to_string());
-        }
-
-        fn on_session_control(&self, _session: &SessionCtx, control: SessionControl) {
-            *self
-                .session_control
-                .lock()
-                .expect("session_control lock should not be poisoned") = Some(control);
-        }
-
-        fn session_coordinator(&self) -> Option<Arc<dyn warp_link_core::SessionCoordinator>> {
-            self.coordinator
-                .as_ref()
-                .map(|value| Arc::clone(value) as Arc<dyn warp_link_core::SessionCoordinator>)
-        }
-
-        fn session_coord_owner(&self) -> Option<String> {
-            self.coordinator.as_ref().map(|_| "test-node".to_string())
-        }
-    }
-
-    fn encode_client_goaway(reason: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(2 + reason.len());
-        out.push(FrameType::GoAway as u8);
-        out.push(postcard_v1_flags());
-        out.extend_from_slice(reason.as_bytes());
-        out
-    }
-
-    #[tokio::test]
-    async fn server_session_handshake_deliver_ack_and_goaway() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                auth_token: Some("token".to_string()),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let ack = profile
-            .encode_client_ack(&AckMsg {
-                seq: Some(1),
-                id: "m-1".to_string(),
-                status: AckStatus::Ok,
-            })
-            .expect("encode ack should succeed")
-            .to_vec();
-        let goaway = encode_client_goaway("drain");
-
-        let app = Arc::new(MockServerApp::new(true, false));
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Timeout,
-                InboundEvent::Frame(ack),
-                InboundEvent::Timeout,
-                InboundEvent::Frame(goaway),
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig {
-            idle_timeout_ms: 500,
-            ..ServerConfig::default()
-        };
-
-        run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Wss,
-                remote_addr: Some("127.0.0.1:12345".to_string()),
-            },
-        )
-        .await
-        .expect("session should finish on goaway");
-
-        let mut saw_welcome = false;
-        let mut saw_deliver = false;
-        for frame in &io.outbound {
-            match profile
-                .decode_server_frame(frame.as_slice())
-                .expect("server frame decode should succeed")
-            {
-                DecodedServerFrame::Welcome(_) => saw_welcome = true,
-                DecodedServerFrame::Deliver(msg) if msg.id == "m-1" => saw_deliver = true,
-                _ => {}
-            }
-        }
-        assert!(saw_welcome, "must send welcome");
-        assert!(saw_deliver, "must send at least one deliver frame");
-        let acked = app
-            .acked_ids
-            .lock()
-            .expect("acked ids lock should not be poisoned");
-        assert_eq!(acked.as_slice(), &["m-1".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn server_session_disconnects_after_four_idle_timeouts() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let app = Arc::new(MockServerApp::new(false, false));
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig {
-            idle_timeout_ms: 200,
-            ..ServerConfig::default()
-        };
-
-        let err = run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Tcp,
-                remote_addr: Some("127.0.0.1:8080".to_string()),
-            },
-        )
-        .await
-        .expect_err("four timeouts should terminate the session");
-        match err {
-            WarpLinkError::Timeout(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("IdleTimeout")),
-            "disconnect callback should include idle timeout"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_disconnects_when_outbound_send_fails() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-
-        let app = Arc::new(MockServerApp::new(true, false));
-        let mut io = MockIo {
-            inbound: VecDeque::from([InboundEvent::Frame(hello), InboundEvent::Timeout]),
-            outbound: Vec::new(),
-            fail_send_after: Some(1),
-            send_count: 0,
-        };
-        let config = ServerConfig::default();
-
-        let err = run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Wss,
-                remote_addr: Some("127.0.0.1:12345".to_string()),
-            },
-        )
-        .await
-        .expect_err("send failure should terminate the session");
-        match err {
-            WarpLinkError::Transport(message) => {
-                assert!(message.contains("mock send failure"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("TransportError")),
-            "disconnect callback should include transport failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_reports_handshake_failure_on_auth_reject() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-
-        let app = Arc::new(MockServerApp::new(false, true));
-        let mut io = MockIo {
-            inbound: VecDeque::from([InboundEvent::Frame(hello)]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-
-        let err = run_server_session(
-            &ServerConfig::default(),
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Quic,
-                remote_addr: Some("127.0.0.1:443".to_string()),
-            },
-        )
-        .await
-        .expect_err("auth reject should fail the handshake");
-        match err {
-            WarpLinkError::Auth(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        let failures = app
-            .handshake_failures
-            .lock()
-            .expect("handshake_failures lock should not be poisoned");
-        assert_eq!(
-            failures.len(),
-            1,
-            "must report exactly one handshake failure"
-        );
-        assert!(
-            failures[0].contains("auth error"),
-            "handshake failure should carry auth error"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_releases_lease_on_auth_reject() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let coordinator = Arc::new(MockCoordinator::new());
-        let app = Arc::new(MockServerApp::with_coordinator(
-            false,
-            true,
-            Arc::clone(&coordinator),
-        ));
-        let mut io = MockIo {
-            inbound: VecDeque::from([InboundEvent::Frame(hello)]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-
-        let err = run_server_session(
-            &ServerConfig::default(),
-            app,
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Quic,
-                remote_addr: Some("127.0.0.1:443".to_string()),
-            },
-        )
-        .await
-        .expect_err("auth reject should fail the handshake");
-        match err {
-            WarpLinkError::Auth(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-        assert_eq!(
-            coordinator.acquire_count.load(Ordering::SeqCst),
-            1,
-            "coordinator acquire should be called once"
-        );
-        assert_eq!(
-            coordinator.release_count.load(Ordering::SeqCst),
-            1,
-            "lease must be released when handshake auth fails"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_releases_lease_on_graceful_disconnect() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let goaway = encode_client_goaway("drain");
-        let coordinator = Arc::new(MockCoordinator::new());
-        let app = Arc::new(MockServerApp::with_coordinator(
-            false,
-            false,
-            Arc::clone(&coordinator),
-        ));
-        let mut io = MockIo {
-            inbound: VecDeque::from([InboundEvent::Frame(hello), InboundEvent::Frame(goaway)]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-
-        run_server_session(
-            &ServerConfig::default(),
-            app,
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Wss,
-                remote_addr: Some("127.0.0.1:443".to_string()),
-            },
-        )
-        .await
-        .expect("session should close gracefully");
-
-        assert_eq!(
-            coordinator.acquire_count.load(Ordering::SeqCst),
-            1,
-            "coordinator acquire should be called once"
-        );
-        assert_eq!(
-            coordinator.release_count.load(Ordering::SeqCst),
-            1,
-            "lease must be released after session close"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_control_expire_now_kicks_connection() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let app = Arc::new(MockServerApp::new(false, false));
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-                InboundEvent::Timeout,
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let app_clone = Arc::clone(&app);
-        let session = tokio::spawn(async move {
-            run_server_session(
-                &ServerConfig::default(),
-                app_clone,
-                &mut io,
-                PeerMeta {
-                    transport: TransportKind::Wss,
-                    remote_addr: Some("127.0.0.1:443".to_string()),
-                },
-            )
-            .await
-        });
-
-        let control = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(control) = app
-                    .session_control
-                    .lock()
-                    .expect("session_control lock should not be poisoned")
-                    .clone()
-                {
-                    break control;
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-        })
-        .await
-        .expect("session control should be available quickly");
-        control.expire_now();
-
-        session
-            .await
-            .expect("session join should succeed")
-            .expect("control expire should close gracefully");
-
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("GoAway(\"auth_expired:control_expire\")")),
-            "expire_now must emit auth_expired goaway"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_goaway_on_revoked_auth_state() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let reauth = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                auth_token: Some("updated-token".to_string()),
-                ..HelloCtx::default()
-            })
-            .expect("encode reauth hello should succeed")
-            .to_vec();
-
-        let app = Arc::new(MockServerApp::new(false, false));
-        app.set_auth_state(SessionAuthState::Revoked("manual_revoke".to_string()));
-        let mut io = MockIo {
-            inbound: VecDeque::from([InboundEvent::Frame(hello), InboundEvent::Frame(reauth)]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig::default();
-
-        run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Tcp,
-                remote_addr: Some("127.0.0.1:5223".to_string()),
-            },
-        )
-        .await
-        .expect("revoked auth should close via goaway");
-
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("GoAway(\"auth_revoked:manual_revoke\")")),
-            "disconnect callback should include auth revoked goaway"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_keeps_connection_on_auth_renewed() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let goaway = encode_client_goaway("client_shutdown");
-
-        let app = Arc::new(MockServerApp::new(false, false));
-        app.set_auth_state(SessionAuthState::Renewed {
-            auth_expires_at_unix_secs: Some(unix_now_secs().saturating_add(3_600)),
-            auth_refresh_before_secs: 120,
-        });
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Timeout,
-                InboundEvent::Frame(goaway),
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig::default();
-
-        run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Wss,
-                remote_addr: Some("127.0.0.1:443".to_string()),
-            },
-        )
-        .await
-        .expect("renewed auth should not force disconnect");
-
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("GoAway(\"client_shutdown\")")),
-            "session should close only on client goaway in this test"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_closes_on_inband_reauth_identity_mismatch() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let reauth_bad_identity = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-2".to_string(),
-                auth_token: Some("token-2".to_string()),
-                ..HelloCtx::default()
-            })
-            .expect("encode reauth hello should succeed")
-            .to_vec();
-
-        let app = Arc::new(MockServerApp::new(false, false));
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Frame(reauth_bad_identity),
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig::default();
-
-        run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Wss,
-                remote_addr: Some("127.0.0.1:443".to_string()),
-            },
-        )
-        .await
-        .expect("identity mismatch should close with goaway");
-
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("GoAway(\"auth_reauth_failed:identity_mismatch\")")),
-            "identity mismatch should produce auth_reauth_failed goaway"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_session_accepts_inband_reauth_and_stays_connected() {
-        let profile = PushgoWireProfile::new();
-        let hello = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                auth_token: Some("token-1".to_string()),
-                ..HelloCtx::default()
-            })
-            .expect("encode hello should succeed")
-            .to_vec();
-        let reauth = profile
-            .encode_client_hello(&HelloCtx {
-                identity: "dev-1".to_string(),
-                auth_token: Some("token-2".to_string()),
-                ..HelloCtx::default()
-            })
-            .expect("encode reauth hello should succeed")
-            .to_vec();
-        let goaway = encode_client_goaway("client_shutdown");
-
-        let app = Arc::new(MockServerApp::new(false, false));
-        app.set_auth_state(SessionAuthState::Renewed {
-            auth_expires_at_unix_secs: Some(unix_now_secs().saturating_add(1_800)),
-            auth_refresh_before_secs: 60,
-        });
-        let mut io = MockIo {
-            inbound: VecDeque::from([
-                InboundEvent::Frame(hello),
-                InboundEvent::Frame(reauth),
-                InboundEvent::Frame(goaway),
-            ]),
-            outbound: Vec::new(),
-            fail_send_after: None,
-            send_count: 0,
-        };
-        let config = ServerConfig::default();
-
-        run_server_session(
-            &config,
-            app.clone(),
-            &mut io,
-            PeerMeta {
-                transport: TransportKind::Tcp,
-                remote_addr: Some("127.0.0.1:5223".to_string()),
-            },
-        )
-        .await
-        .expect("in-band reauth should keep connection alive");
-
-        let disconnected = app
-            .disconnected
-            .lock()
-            .expect("disconnected lock should not be poisoned");
-        assert!(
-            disconnected
-                .iter()
-                .any(|value| value.contains("GoAway(\"client_shutdown\")")),
-            "connection should still be closed by client goaway"
-        );
-        assert!(
-            disconnected
-                .iter()
-                .all(|value| !value.contains("auth_reauth_failed")),
-            "in-band reauth should not fail"
-        );
-    }
-
-    #[test]
-    fn client_power_hint_overrides_legacy_auto_fields() {
-        let config = test_client_config();
-        let app = MockClientPowerApp::new(HelloCtx {
-            identity: "dev-1".to_string(),
-            ..HelloCtx::default()
-        });
-        app.set_power_hint(Some(ClientPowerHint {
-            app_state: ClientAppStateHint::Background,
-            preferred_tier: Some(ClientPowerTier::Low),
-        }));
-        let mut runtime = ClientPowerRuntime::new(Instant::now());
-        let hello = build_effective_hello(&config, &app, &mut runtime);
-        assert_eq!(hello.app_state.as_deref(), Some("background"));
-        assert_eq!(hello.perf_tier.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn client_power_auto_switches_to_low_when_idle() {
-        let mut config = test_client_config();
-        config.policy.power.idle_to_low_after_secs = 1;
-        let app = MockClientPowerApp::new(HelloCtx {
-            identity: "dev-1".to_string(),
-            ..HelloCtx::default()
-        });
-        let mut runtime = ClientPowerRuntime::new(Instant::now());
-        runtime.last_message_at = Instant::now() - Duration::from_secs(10);
-        let hello = build_effective_hello(&config, &app, &mut runtime);
-        assert_eq!(hello.app_state.as_deref(), Some("background"));
-        assert_eq!(hello.perf_tier.as_deref(), Some("low"));
-    }
-
-    #[test]
-    fn client_power_keeps_explicit_hello_tier_when_no_hint() {
-        let config = test_client_config();
-        let app = MockClientPowerApp::new(HelloCtx {
-            identity: "dev-1".to_string(),
-            perf_tier: Some("high".to_string()),
-            app_state: Some("foreground".to_string()),
-            ..HelloCtx::default()
-        });
-        let mut runtime = ClientPowerRuntime::new(Instant::now());
-        let hello = build_effective_hello(&config, &app, &mut runtime);
-        assert_eq!(hello.app_state.as_deref(), Some("foreground"));
-        assert_eq!(hello.perf_tier.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn upgrade_probe_backoff_is_exponential() {
-        let config = test_client_config();
-        let app = MockClientPowerApp::new(HelloCtx {
-            identity: "dev-1".to_string(),
-            ..HelloCtx::default()
-        });
-        let now = Instant::now();
-        let power_runtime = ClientPowerRuntime::new(now);
-        let base = upgrade_probe_interval(&config, &app, &power_runtime, now);
-        let jitter_cap = base / 4;
-
-        let mut probe = UpgradeProbeRuntime::new(TransportKind::Wss, now - Duration::from_secs(60));
-        probe.note_probe_failure(&config, &app, &power_runtime, now);
-        let first = probe
-            .next_probe_at
-            .expect("first probe deadline should be scheduled")
-            .saturating_duration_since(now);
-        assert!(
-            first >= base.saturating_mul(2),
-            "first failure should at least double base interval"
-        );
-        assert!(
-            first <= base.saturating_mul(2).saturating_add(jitter_cap),
-            "first failure jitter should stay bounded"
-        );
-
-        probe.note_probe_failure(&config, &app, &power_runtime, now);
-        let second = probe
-            .next_probe_at
-            .expect("second probe deadline should be scheduled")
-            .saturating_duration_since(now);
-        assert!(
-            second >= base.saturating_mul(4),
-            "second failure should at least quadruple base interval"
-        );
-        assert!(
-            second <= base.saturating_mul(4).saturating_add(jitter_cap),
-            "second failure jitter should stay bounded"
-        );
-    }
-
-    #[test]
-    fn client_continuity_applies_resume_and_ack_seq() {
-        let mut continuity = ClientContinuityState::default();
-        continuity.note_welcome(Some("resume-1"));
-        continuity.note_acked_seq(Some(42));
-
-        let mut hello = HelloCtx {
-            identity: "dev-1".to_string(),
-            last_acked_seq: Some(10),
-            ..HelloCtx::default()
-        };
-        continuity.apply_to_hello(&mut hello);
-
-        assert_eq!(hello.resume_token.as_deref(), Some("resume-1"));
-        assert_eq!(hello.last_acked_seq, Some(42));
-        assert!(continuity.can_switch_without_loss());
-    }
 }

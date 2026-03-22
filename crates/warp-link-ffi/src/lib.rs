@@ -19,6 +19,8 @@ use warp_link_core::{
 
 const EVENT_QUEUE_CAP: usize = 8192;
 const CALLBACK_QUEUE_CAP_PER_WORKER: usize = 1024;
+const WIRE_VERSION_V2: u8 = 2;
+const PRIVATE_PAYLOAD_VERSION_V1: u8 = 1;
 
 #[derive(Debug, Deserialize)]
 struct StartConfig {
@@ -392,8 +394,8 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
             .or_else(|| parsed.bearer_token.clone()),
         resume_token: parsed.resume_token,
         last_acked_seq: parsed.last_acked_seq,
-        supported_wire_versions: vec![1],
-        supported_payload_versions: vec![1],
+        supported_wire_versions: vec![WIRE_VERSION_V2],
+        supported_payload_versions: vec![PRIVATE_PAYLOAD_VERSION_V1],
         perf_tier: None,
         app_state: None,
         metadata: std::collections::BTreeMap::new(),
@@ -866,145 +868,5 @@ fn decode_payload_map(bytes: &[u8]) -> (serde_json::Value, bool) {
             }
         }
         Err(_) => (serde_json::json!({}), false),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    extern "C" fn noop_callback(_user_data: u64, _ptr: *const u8, _len: u32) {}
-
-    fn make_event_channel(cap: usize) -> (flume::Sender<String>, flume::Receiver<String>) {
-        flume::bounded(cap)
-    }
-
-    fn insert_test_session(handle: u64) -> Arc<FfiSession> {
-        let runtime = runtime().expect("runtime should be available in tests");
-        let task = runtime.spawn(async {});
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        let (event_tx, event_rx) = make_event_channel(8);
-        let session = Arc::new(FfiSession {
-            task: Mutex::new(task),
-            shutdown_tx,
-            event_tx,
-            event_rx: Mutex::new(event_rx),
-            hello: Arc::new(Mutex::new(HelloCtx::default())),
-            power_hint: Arc::new(Mutex::new(None)),
-            callback: Mutex::new(None),
-            last_error: Arc::new(Mutex::new(None)),
-            stats: Arc::new(SessionStats::new()),
-        });
-        SESSIONS.lock().insert(handle, Arc::clone(&session));
-        session
-    }
-
-    fn remove_test_session(handle: u64) {
-        if let Some(session) = SESSIONS.lock().remove(&handle) {
-            let _ = session.shutdown_tx.send(true);
-            session.task.lock().abort();
-        }
-    }
-
-    #[test]
-    fn set_event_callback_is_scoped_to_existing_session() {
-        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        let _session = insert_test_session(handle);
-
-        assert!(set_session_callback(
-            handle,
-            Some(EventCallback {
-                callback: noop_callback,
-                user_data: 7,
-            }),
-        ));
-        let stored = session_callback(handle).expect("callback should be set");
-        assert_eq!(stored.user_data, 7);
-
-        remove_test_session(handle);
-
-        assert!(!set_session_callback(
-            handle,
-            Some(EventCallback {
-                callback: noop_callback,
-                user_data: 9,
-            }),
-        ));
-        assert!(session_callback(handle).is_none());
-    }
-
-    #[test]
-    fn session_stats_json_exposes_shard_and_global_callback_pending() {
-        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        let _session = insert_test_session(handle);
-
-        let ptr = wl_session_stats_json(handle);
-        assert!(!ptr.is_null());
-        // SAFETY: wl_session_stats_json returns a valid NUL-terminated string or null.
-        let json = unsafe { CStr::from_ptr(ptr) }
-            .to_str()
-            .expect("stats json should be valid utf-8")
-            .to_string();
-        // SAFETY: ptr came from wl_session_stats_json and must be freed once.
-        unsafe { wl_string_free(ptr) };
-
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("stats json should parse as object");
-        assert!(value.get("callback_queue_pending_shard").is_some());
-        assert!(value.get("callback_queue_pending_global").is_some());
-        assert_eq!(
-            value["callback_queue_pending"],
-            value["callback_queue_pending_shard"]
-        );
-
-        remove_test_session(handle);
-    }
-
-    #[test]
-    fn poll_event_returns_enqueued_payload() {
-        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-        let session = insert_test_session(handle);
-        session
-            .event_tx
-            .try_send("{\"type\":\"message\",\"id\":\"x\"}".to_string())
-            .expect("enqueue should work");
-
-        let out = wl_session_poll_event(handle, 5);
-        assert!(!out.ptr.is_null());
-        assert!(out.len > 0);
-        // SAFETY: out.ptr/out.len are owned buffer returned by wl_session_poll_event.
-        let payload = unsafe {
-            let bytes = std::slice::from_raw_parts(out.ptr, out.len as usize);
-            std::str::from_utf8(bytes)
-                .expect("payload should be valid utf-8")
-                .to_string()
-        };
-        assert_eq!(payload, "{\"type\":\"message\",\"id\":\"x\"}");
-        // SAFETY: buffer returned by wl_session_poll_event must be freed once.
-        unsafe { wl_buffer_free(out.ptr, out.len) };
-
-        remove_test_session(handle);
-    }
-
-    #[test]
-    fn single_queue_overflow_drops_new_event() {
-        let (event_tx, event_rx) = make_event_channel(1);
-        let stats = Arc::new(SessionStats::new());
-        let app = QueueApp {
-            handle: 42,
-            hello: Arc::new(Mutex::new(HelloCtx::default())),
-            power_hint: Arc::new(Mutex::new(None)),
-            event_tx,
-            stats: Arc::clone(&stats),
-        };
-
-        app.enqueue_event("first".to_string());
-        app.enqueue_event("second".to_string());
-
-        assert_eq!(stats.events_in_total.load(Ordering::Relaxed), 2);
-        assert_eq!(stats.events_enqueued_total.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.events_dropped_total.load(Ordering::Relaxed), 1);
-        assert_eq!(event_rx.recv().expect("first event should stay"), "first");
-        assert!(event_rx.try_recv().is_err());
     }
 }

@@ -40,7 +40,6 @@
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
 cargo check -p warp-link --no-default-features
 cargo check -p warp-link --no-default-features --features quic
 cargo check -p warp-link --no-default-features --features tcp

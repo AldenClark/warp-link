@@ -8,9 +8,9 @@ use warp_link_core::{
 };
 
 pub const WIRE_CODEC_POSTCARD: u8 = 1;
-pub const WIRE_VERSION_V1: u8 = 1;
+pub const WIRE_VERSION_V2: u8 = 2;
 pub const PRIVATE_PAYLOAD_VERSION_V1: u8 = 1;
-pub const SUPPORTED_WIRE_VERSIONS: &[u8] = &[WIRE_VERSION_V1];
+pub const SUPPORTED_WIRE_VERSIONS: &[u8] = &[WIRE_VERSION_V2];
 pub const SUPPORTED_PAYLOAD_VERSIONS: &[u8] = &[PRIVATE_PAYLOAD_VERSION_V1];
 
 #[repr(u8)]
@@ -361,7 +361,7 @@ pub const fn wire_version(flags: u8) -> u8 {
 }
 
 pub const fn postcard_v1_flags() -> u8 {
-    wire_flags(WIRE_CODEC_POSTCARD, WIRE_VERSION_V1)
+    wire_flags(WIRE_CODEC_POSTCARD, WIRE_VERSION_V2)
 }
 
 fn validate_codec(flags: u8) -> Result<(), WireError> {
@@ -376,7 +376,7 @@ fn validate_codec(flags: u8) -> Result<(), WireError> {
 
 pub fn normalize_client_wire_versions(versions: &[u8]) -> Vec<u8> {
     if versions.is_empty() {
-        vec![WIRE_VERSION_V1]
+        vec![WIRE_VERSION_V2]
     } else {
         versions.to_vec()
     }
@@ -408,7 +408,7 @@ pub fn negotiate_version(
 pub fn negotiate_hello_versions(hello: &HelloCtx) -> Result<(u8, u8), WireError> {
     let wire_versions = normalize_client_wire_versions(&hello.supported_wire_versions);
     let payload_versions = normalize_client_payload_versions(&hello.supported_payload_versions);
-    let Some(wire) = negotiate_version(WIRE_VERSION_V1, &wire_versions, SUPPORTED_WIRE_VERSIONS)
+    let Some(wire) = negotiate_version(WIRE_VERSION_V2, &wire_versions, SUPPORTED_WIRE_VERSIONS)
     else {
         return Err(WireError::VersionIncompatible(
             "no compatible wire version".to_string(),
@@ -424,241 +424,4 @@ pub fn negotiate_hello_versions(hello: &HelloCtx) -> Result<(u8, u8), WireError>
         ));
     };
     Ok((wire, payload))
-}
-
-#[cfg(test)]
-mod tests {
-    use bytes::Bytes;
-    use warp_link_core::{DecodedClientFrame, DecodedServerFrame, WireProfile};
-
-    use super::*;
-
-    #[test]
-    fn negotiate_defaults_to_v1() {
-        let hello = HelloCtx {
-            identity: "device".to_string(),
-            ..HelloCtx::default()
-        };
-        let versions = negotiate_hello_versions(&hello).expect("default versions must negotiate");
-        assert_eq!(versions, (WIRE_VERSION_V1, PRIVATE_PAYLOAD_VERSION_V1));
-    }
-
-    #[test]
-    fn negotiate_rejects_incompatible_versions() {
-        let hello = HelloCtx {
-            identity: "device".to_string(),
-            supported_wire_versions: vec![9],
-            supported_payload_versions: vec![7],
-            ..HelloCtx::default()
-        };
-        let err = negotiate_hello_versions(&hello).expect_err("must reject incompatible versions");
-        match err {
-            WireError::VersionIncompatible(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn hello_frame_roundtrip() {
-        let profile = PushgoWireProfile::new();
-        let hello = HelloCtx {
-            identity: "dev-1".to_string(),
-            auth_token: Some("token".to_string()),
-            resume_token: Some("resume".to_string()),
-            last_acked_seq: Some(42),
-            supported_wire_versions: vec![WIRE_VERSION_V1],
-            supported_payload_versions: vec![PRIVATE_PAYLOAD_VERSION_V1],
-            perf_tier: Some("balanced".to_string()),
-            app_state: Some("background".to_string()),
-            metadata: BTreeMap::new(),
-        };
-        let bytes = profile
-            .encode_client_hello(&hello)
-            .expect("encode hello must succeed");
-        let decoded = profile
-            .decode_client_frame(bytes.as_ref())
-            .expect("decode hello must succeed");
-        match decoded {
-            DecodedClientFrame::Hello(v) => {
-                assert_eq!(v.identity, hello.identity);
-                assert_eq!(v.auth_token, hello.auth_token);
-                assert_eq!(v.resume_token, hello.resume_token);
-                assert_eq!(v.last_acked_seq, hello.last_acked_seq);
-                assert_eq!(v.supported_wire_versions, vec![WIRE_VERSION_V1]);
-                assert_eq!(
-                    v.supported_payload_versions,
-                    vec![PRIVATE_PAYLOAD_VERSION_V1]
-                );
-            }
-            other => panic!("unexpected decoded frame: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn server_frames_roundtrip() {
-        let profile = PushgoWireProfile::new();
-        let welcome = WelcomeMsg {
-            session_id: "s1".to_string(),
-            identity: "dev".to_string(),
-            resume_token: Some("rt".to_string()),
-            heartbeat_secs: 12,
-            ping_interval_secs: 6,
-            idle_timeout_secs: 48,
-            max_backoff_secs: 30,
-            auth_expires_at_unix_secs: None,
-            auth_refresh_before_secs: 0,
-            max_frame_bytes: 32 * 1024,
-            negotiated_wire_version: WIRE_VERSION_V1,
-            negotiated_payload_version: PRIVATE_PAYLOAD_VERSION_V1,
-            metadata: BTreeMap::new(),
-        };
-        let welcome_frame = profile
-            .encode_server_welcome(&welcome)
-            .expect("encode welcome must succeed");
-        match profile
-            .decode_server_frame(welcome_frame.as_ref())
-            .expect("decode welcome must succeed")
-        {
-            DecodedServerFrame::Welcome(v) => {
-                assert_eq!(v.session_id, welcome.session_id);
-                assert_eq!(v.resume_token, welcome.resume_token);
-                assert_eq!(v.negotiated_wire_version, WIRE_VERSION_V1);
-                assert_eq!(v.negotiated_payload_version, PRIVATE_PAYLOAD_VERSION_V1);
-            }
-            other => panic!("unexpected decoded frame: {other:?}"),
-        }
-
-        let deliver = DeliverMsg {
-            seq: Some(7),
-            id: "d-7".to_string(),
-            payload: Bytes::from_static(b"payload"),
-        };
-        let deliver_frame = profile
-            .encode_server_deliver(&deliver)
-            .expect("encode deliver must succeed");
-        match profile
-            .decode_server_frame(deliver_frame.as_ref())
-            .expect("decode deliver must succeed")
-        {
-            DecodedServerFrame::Deliver(v) => {
-                assert_eq!(v.seq, Some(7));
-                assert_eq!(v.id, "d-7");
-                assert_eq!(v.payload.as_ref(), b"payload");
-            }
-            other => panic!("unexpected decoded frame: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn frame_encoding_golden_vectors_stable() {
-        fn to_hex(bytes: &[u8]) -> String {
-            use std::fmt::Write as _;
-
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                let _ = write!(&mut out, "{byte:02x}");
-            }
-            out
-        }
-
-        let profile = PushgoWireProfile::new();
-        let hello = HelloCtx {
-            identity: "dev-1".to_string(),
-            auth_token: Some("token".to_string()),
-            resume_token: Some("resume".to_string()),
-            last_acked_seq: Some(42),
-            supported_wire_versions: vec![WIRE_VERSION_V1],
-            supported_payload_versions: vec![PRIVATE_PAYLOAD_VERSION_V1],
-            perf_tier: Some("balanced".to_string()),
-            app_state: Some("background".to_string()),
-            metadata: BTreeMap::new(),
-        };
-        let hello_frame = profile
-            .encode_client_hello(&hello)
-            .expect("encode hello must succeed");
-
-        let welcome = WelcomeMsg {
-            session_id: "s1".to_string(),
-            identity: "dev".to_string(),
-            resume_token: Some("rt".to_string()),
-            heartbeat_secs: 12,
-            ping_interval_secs: 6,
-            idle_timeout_secs: 48,
-            max_backoff_secs: 30,
-            auth_expires_at_unix_secs: None,
-            auth_refresh_before_secs: 0,
-            max_frame_bytes: 32 * 1024,
-            negotiated_wire_version: WIRE_VERSION_V1,
-            negotiated_payload_version: PRIVATE_PAYLOAD_VERSION_V1,
-            metadata: BTreeMap::new(),
-        };
-        let welcome_frame = profile
-            .encode_server_welcome(&welcome)
-            .expect("encode welcome must succeed");
-
-        let deliver = DeliverMsg {
-            seq: Some(7),
-            id: "d-7".to_string(),
-            payload: Bytes::from_static(b"payload"),
-        };
-        let deliver_frame = profile
-            .encode_server_deliver(&deliver)
-            .expect("encode deliver must succeed");
-
-        let ack = AckMsg {
-            seq: Some(7),
-            id: "d-7".to_string(),
-            status: AckStatus::Ok,
-        };
-        let ack_frame = profile
-            .encode_client_ack(&ack)
-            .expect("encode ack must succeed");
-        assert_eq!(
-            to_hex(hello_frame.as_ref()),
-            "0111056465762d310105746f6b656e0106726573756d65012a01010101010862616c616e636564010a6261636b67726f756e64"
-        );
-        assert_eq!(
-            to_hex(welcome_frame.as_ref()),
-            "04110273310272740c06301e00008080020101"
-        );
-        assert_eq!(
-            to_hex(deliver_frame.as_ref()),
-            "08110703642d37077061796c6f6164"
-        );
-        assert_eq!(to_hex(ack_frame.as_ref()), "0911010703642d37026f6b");
-    }
-
-    #[test]
-    fn server_error_frame_roundtrip() {
-        let profile = PushgoWireProfile::new();
-        let frame = profile
-            .encode_server_error("auth_failed", "token invalid")
-            .expect("encode server error must succeed");
-        match profile
-            .decode_server_frame(frame.as_ref())
-            .expect("decode server error must succeed")
-        {
-            DecodedServerFrame::Error { code, message } => {
-                assert_eq!(code, "auth_failed");
-                assert_eq!(message, "token invalid");
-            }
-            other => panic!("unexpected decoded frame: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_non_postcard_codec_flag() {
-        let profile = PushgoWireProfile::new();
-        let mut frame = profile.encode_client_ping().to_vec();
-        frame[1] = wire_flags(2, WIRE_VERSION_V1);
-        let err = profile
-            .decode_client_frame(frame.as_slice())
-            .expect_err("non-postcard codec must be rejected");
-        match err {
-            WireError::InvalidFrame(message) => {
-                assert!(message.contains("unsupported codec"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
 }

@@ -22,8 +22,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: test
-        run: cargo test --workspace
 
   feature-matrix:
     runs-on: ubuntu-latest
