@@ -355,6 +355,17 @@ pub enum ClientEvent {
     Fatal {
         error: String,
     },
+    ProbeRtt {
+        transport: TransportKind,
+        rtt_ms: u64,
+        source: ProbeRttSource,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeRttSource {
+    Manual,
+    IdleKeepalive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +380,9 @@ pub trait ClientApp: Send + Sync + 'static {
     fn on_event(&self, event: ClientEvent) -> AppDecision;
     fn power_hint(&self) -> Option<ClientPowerHint> {
         None
+    }
+    fn take_probe_request(&self) -> bool {
+        false
     }
 }
 

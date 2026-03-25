@@ -841,6 +841,20 @@ fn event_to_json(event: &ClientEvent) -> String {
             "error": error,
         })
         .to_string(),
+        ClientEvent::ProbeRtt {
+            transport,
+            rtt_ms,
+            source,
+        } => serde_json::json!({
+            "type": "probe_rtt",
+            "transport": transport.to_string(),
+            "rtt_ms": rtt_ms,
+            "source": match source {
+                warp_link_core::ProbeRttSource::Manual => "manual",
+                warp_link_core::ProbeRttSource::IdleKeepalive => "idle_keepalive",
+            },
+        })
+        .to_string(),
         ClientEvent::Message { .. } => serde_json::json!({
             "type": "internal_error",
             "error": "message events are serialized in QueueApp::on_event",

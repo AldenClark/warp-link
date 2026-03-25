@@ -45,8 +45,8 @@ use warp_link_core::{
     AckMsg, AckStatus, AppDecision, AuthCheckPhase, AuthError, AuthRequest, AuthResponse,
     ClientApp, ClientAppStateHint, ClientConfig, ClientEvent, ClientPowerPolicy, ClientPowerTier,
     DecodedClientFrame, DecodedServerFrame, DisconnectReason, HelloCtx, OutboundMsg, PeerMeta,
-    ServerApp, ServerConfig, SessionAuthState, SessionControl, SessionControlOps, TlsMode,
-    TransportKind, WarpLinkError,
+    ProbeRttSource, ServerApp, ServerConfig, SessionAuthState, SessionControl, SessionControlOps,
+    TlsMode, TransportKind, WarpLinkError,
 };
 use warp_link_transport::ClientIo;
 #[cfg(feature = "quic")]
@@ -201,6 +201,8 @@ async fn run_client_session_once(
     let mut idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
     let mut idle_timeout_streak = 0u8;
     let mut last_idle_ping_at = Instant::now();
+    let mut pending_ping_sent_at: Option<Instant> = None;
+    let mut pending_ping_source: Option<ProbeRttSource> = None;
     let mut upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
     upgrade_probe_runtime.schedule_next(config, app.as_ref(), &power_runtime, Instant::now());
 
@@ -214,6 +216,12 @@ async fn run_client_session_once(
             continuity,
         )
         .await?;
+        if app.take_probe_request() && pending_ping_sent_at.is_none() {
+            let ping = config.wire_profile.encode_client_ping();
+            io.send_frame(&ping, config.policy.write_timeout_ms).await?;
+            pending_ping_sent_at = Some(Instant::now());
+            pending_ping_source = Some(ProbeRttSource::Manual);
+        }
         let now = Instant::now();
         let recv_timeout_ms = next_recv_timeout_ms(config, &upgrade_probe_runtime, now)
             .unwrap_or(idle_timeout_ms)
@@ -293,6 +301,10 @@ async fn run_client_session_once(
                     let ping = config.wire_profile.encode_client_ping();
                     io.send_frame(&ping, config.policy.write_timeout_ms).await?;
                     last_idle_ping_at = now;
+                    if pending_ping_sent_at.is_none() {
+                        pending_ping_sent_at = Some(now);
+                        pending_ping_source = Some(ProbeRttSource::IdleKeepalive);
+                    }
                 }
                 continue;
             }
@@ -333,7 +345,21 @@ async fn run_client_session_once(
                 let pong = config.wire_profile.encode_client_pong();
                 io.send_frame(&pong, config.policy.write_timeout_ms).await?;
             }
-            DecodedServerFrame::Pong => {}
+            DecodedServerFrame::Pong => {
+                if let Some(sent_at) = pending_ping_sent_at.take() {
+                    let source = pending_ping_source.take().unwrap_or(ProbeRttSource::Manual);
+                    let rtt_ms = Instant::now()
+                        .saturating_duration_since(sent_at)
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    let _ = app.on_event(ClientEvent::ProbeRtt {
+                        transport,
+                        rtt_ms,
+                        source,
+                    });
+                }
+            }
             DecodedServerFrame::GoAway(reason) => {
                 let goaway_reason = reason.unwrap_or_else(|| "goaway".to_string());
                 let _ = app.on_event(ClientEvent::Disconnected {
