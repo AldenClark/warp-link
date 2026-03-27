@@ -458,3 +458,49 @@ fn verify_wss_pin(
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_wss_path_applies_default_and_leading_slash() {
+        assert_eq!(normalize_wss_path(""), "/private/ws");
+        assert_eq!(normalize_wss_path("private/ws"), "/private/ws");
+        assert_eq!(normalize_wss_path("/private/ws"), "/private/ws");
+    }
+
+    #[test]
+    fn normalize_pin_accepts_sha256_prefix_and_colons() {
+        let normalized = normalize_pin(
+            "sha256:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+        )
+        .expect("pin should normalize");
+        assert_eq!(
+            normalized,
+            "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+        );
+        assert!(normalize_pin("sha256:xyz").is_none());
+    }
+
+    #[test]
+    fn resolve_cert_pin_prefers_specific_then_shared() {
+        assert_eq!(
+            resolve_cert_pin(Some("  specific  "), Some("shared")),
+            Some("specific")
+        );
+        assert_eq!(resolve_cert_pin(Some(""), Some("shared")), Some("shared"));
+        assert_eq!(resolve_cert_pin(None, Some(" shared ")), Some("shared"));
+        assert_eq!(resolve_cert_pin(None, None), None);
+    }
+
+    #[test]
+    fn cert_sha256_hex_is_deterministic() {
+        let digest1 = cert_sha256_hex(b"cert-bytes");
+        let digest2 = cert_sha256_hex(b"cert-bytes");
+        let digest3 = cert_sha256_hex(b"other-cert-bytes");
+        assert_eq!(digest1, digest2);
+        assert_ne!(digest1, digest3);
+        assert_eq!(digest1.len(), 64);
+    }
+}

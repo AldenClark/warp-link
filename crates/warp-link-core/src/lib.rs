@@ -22,6 +22,58 @@ impl fmt::Display for TransportKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerState {
+    Idle,
+    PrimaryConnecting,
+    PrimaryActive,
+    CandidateConnecting,
+    CutoverReady,
+    DrainingOld,
+    Recovering,
+    BlockedByPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionWinnerLayer {
+    UserCommand,
+    AppPolicy,
+    AdaptiveScheduler,
+    GatewayHint,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransportHealthSnapshot {
+    pub timeout_rate: Option<f32>,
+    pub ack_non_ok_ratio: Option<f32>,
+    pub dead_air_secs: Option<u64>,
+    pub rtt_ewma_ms: Option<u64>,
+    pub rtt_jitter_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecisionTrace {
+    pub decision_id: u64,
+    pub winner_layer: DecisionWinnerLayer,
+    pub reason_code: String,
+    pub selected_transport: Option<TransportKind>,
+    pub inputs_digest: String,
+    pub suppressed_candidates: Vec<TransportKind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PinnedTransport {
+    pub transport: TransportKind,
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PolicyInput {
+    pub disabled_transports: Vec<TransportKind>,
+    pub pinned_transport: Option<PinnedTransport>,
+    pub force_reconnect_nonce: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientPolicy {
     pub connect_budget_ms: u64,
@@ -36,6 +88,23 @@ pub struct ClientPolicy {
     pub upgrade_probe_foreground_interval_secs: u16,
     pub upgrade_probe_background_interval_secs: u16,
     pub upgrade_probe_min_dwell_secs: u16,
+    pub scheduler_hysteresis_percent: u8,
+    pub scheduler_upgrade_confirm_windows: u8,
+    pub scheduler_downgrade_confirm_windows: u8,
+    pub scheduler_max_migrations_per_5m: u8,
+    pub scheduler_cooldown_secs: u16,
+    pub health_timeout_rate_threshold: f32,
+    pub health_ack_non_ok_ratio_threshold: f32,
+    pub health_dead_air_secs: u16,
+    pub dead_connection_probe_failure_threshold: u8,
+    pub mobility_enabled: bool,
+    pub mobility_min_dwell_secs: u16,
+    pub mobility_upgrade_probe_foreground_interval_secs: u16,
+    pub mobility_upgrade_probe_background_interval_secs: u16,
+    pub mobility_upgrade_confirm_windows: u8,
+    pub scheduler_v2_enabled: bool,
+    pub drain_timeout_ms: u64,
+    pub cutover_guard_ms: u64,
     pub power: ClientPowerPolicy,
 }
 
@@ -54,6 +123,23 @@ impl Default for ClientPolicy {
             upgrade_probe_foreground_interval_secs: 45,
             upgrade_probe_background_interval_secs: 180,
             upgrade_probe_min_dwell_secs: 20,
+            scheduler_hysteresis_percent: 8,
+            scheduler_upgrade_confirm_windows: 4,
+            scheduler_downgrade_confirm_windows: 3,
+            scheduler_max_migrations_per_5m: 2,
+            scheduler_cooldown_secs: 90,
+            health_timeout_rate_threshold: 0.35,
+            health_ack_non_ok_ratio_threshold: 0.12,
+            health_dead_air_secs: 12,
+            dead_connection_probe_failure_threshold: 2,
+            mobility_enabled: true,
+            mobility_min_dwell_secs: 60,
+            mobility_upgrade_probe_foreground_interval_secs: 90,
+            mobility_upgrade_probe_background_interval_secs: 180,
+            mobility_upgrade_confirm_windows: 5,
+            scheduler_v2_enabled: false,
+            drain_timeout_ms: 8_000,
+            cutover_guard_ms: 1_500,
             power: ClientPowerPolicy::default(),
         }
     }
@@ -360,6 +446,42 @@ pub enum ClientEvent {
         rtt_ms: u64,
         source: ProbeRttSource,
     },
+    SchedulerStateChanged {
+        state: SchedulerState,
+        reason_code: String,
+    },
+    CandidateStarted {
+        from: TransportKind,
+        to: TransportKind,
+        decision_id: u64,
+    },
+    CandidateReady {
+        from: TransportKind,
+        to: TransportKind,
+        decision_id: u64,
+    },
+    CutoverCommitted {
+        from: TransportKind,
+        to: TransportKind,
+        decision_id: u64,
+    },
+    CutoverRollback {
+        restored: TransportKind,
+        failed: TransportKind,
+        decision_id: u64,
+        reason: String,
+    },
+    DeadConnectionDetected {
+        transport: TransportKind,
+        reason_code: String,
+    },
+    RecoveryTierEntered {
+        tier: u8,
+        reason_code: String,
+    },
+    DecisionTrace {
+        trace: DecisionTrace,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +500,9 @@ pub enum AppDecision {
 pub trait ClientApp: Send + Sync + 'static {
     fn on_hello(&self) -> HelloCtx;
     fn on_event(&self, event: ClientEvent) -> AppDecision;
+    fn scheduler_policy(&self) -> PolicyInput {
+        PolicyInput::default()
+    }
     fn power_hint(&self) -> Option<ClientPowerHint> {
         None
     }
@@ -525,4 +650,48 @@ pub enum WarpLinkError {
     Protocol(String),
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_kind_display_is_stable() {
+        assert_eq!(TransportKind::Quic.to_string(), "quic");
+        assert_eq!(TransportKind::Wss.to_string(), "wss");
+        assert_eq!(TransportKind::Tcp.to_string(), "tcp");
+    }
+
+    #[test]
+    fn client_policy_default_backoff_is_non_decreasing() {
+        let policy = ClientPolicy::default();
+        assert!(policy.connect_budget_ms > 0);
+        assert!(policy.connect_timeout_ms > 0);
+        assert!(policy.write_timeout_ms > 0);
+        assert!(
+            policy.backoff_max_ms >= policy.backoff_min_ms,
+            "max backoff should not be smaller than min backoff"
+        );
+    }
+
+    #[test]
+    fn server_config_default_runtime_limits_are_sane() {
+        let config = ServerConfig::default();
+        assert!(config.hello_timeout_ms > 0);
+        assert!(config.idle_timeout_ms > config.hello_timeout_ms);
+        assert!(config.max_concurrent_sessions > 0);
+        assert!(config.max_outbound_wait_ms >= config.min_outbound_wait_ms);
+    }
+
+    #[test]
+    fn hello_ctx_default_is_empty_and_safe() {
+        let hello = HelloCtx::default();
+        assert!(hello.identity.is_empty());
+        assert!(hello.auth_token.is_none());
+        assert!(hello.resume_token.is_none());
+        assert!(hello.last_acked_seq.is_none());
+        assert!(hello.supported_wire_versions.is_empty());
+        assert!(hello.supported_payload_versions.is_empty());
+    }
 }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "wss"))]
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -44,9 +45,10 @@ use tokio_tungstenite::{
 use warp_link_core::{
     AckMsg, AckStatus, AppDecision, AuthCheckPhase, AuthError, AuthRequest, AuthResponse,
     ClientApp, ClientAppStateHint, ClientConfig, ClientEvent, ClientPowerPolicy, ClientPowerTier,
-    DecodedClientFrame, DecodedServerFrame, DisconnectReason, HelloCtx, OutboundMsg, PeerMeta,
-    ProbeRttSource, ServerApp, ServerConfig, SessionAuthState, SessionControl, SessionControlOps,
-    TlsMode, TransportKind, WarpLinkError,
+    DecisionTrace, DecisionWinnerLayer, DecodedClientFrame, DecodedServerFrame, DisconnectReason,
+    HelloCtx, OutboundMsg, PeerMeta, PolicyInput, ProbeRttSource, SchedulerState, ServerApp,
+    ServerConfig, SessionAuthState, SessionControl, SessionControlOps, TlsMode, TransportKind,
+    WarpLinkError,
 };
 use warp_link_transport::ClientIo;
 #[cfg(feature = "quic")]
@@ -97,6 +99,413 @@ impl ClientContinuityState {
     fn can_switch_without_loss(&self) -> bool {
         self.resume_token.is_some()
     }
+}
+
+#[derive(Debug, Clone)]
+struct TransportPlan {
+    attempts: Vec<(TransportKind, u64)>,
+    suppressed_candidates: Vec<TransportKind>,
+    winner_layer: DecisionWinnerLayer,
+    reason_code: &'static str,
+}
+
+fn epoch_millis_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn pinned_transport_active(policy: &PolicyInput) -> Option<TransportKind> {
+    let pinned = policy.pinned_transport.as_ref()?;
+    let now_ms = epoch_millis_now();
+    if let Some(expires_at_unix_ms) = pinned.expires_at_unix_ms
+        && now_ms >= expires_at_unix_ms
+    {
+        return None;
+    }
+    Some(pinned.transport)
+}
+
+fn transport_disabled_by_policy(policy: &PolicyInput, transport: TransportKind) -> bool {
+    policy
+        .disabled_transports
+        .iter()
+        .any(|disabled| *disabled == transport)
+}
+
+fn default_transport_order() -> Vec<TransportKind> {
+    let mut order = Vec::new();
+    #[cfg(feature = "quic")]
+    {
+        order.push(TransportKind::Quic);
+    }
+    #[cfg(feature = "tcp")]
+    {
+        order.push(TransportKind::Tcp);
+    }
+    #[cfg(feature = "wss")]
+    {
+        order.push(TransportKind::Wss);
+    }
+    order
+}
+
+fn transport_start_delay_ms(
+    config: &ClientConfig,
+    transport: TransportKind,
+    position: usize,
+) -> u64 {
+    if position == 0 {
+        return 0;
+    }
+    match transport {
+        TransportKind::Quic => 0,
+        TransportKind::Tcp => config.policy.tcp_delay_ms,
+        TransportKind::Wss => config.policy.wss_delay_ms,
+    }
+}
+
+fn build_transport_plan(config: &ClientConfig, policy: &PolicyInput) -> TransportPlan {
+    let base_order = default_transport_order();
+    let pinned = pinned_transport_active(policy);
+    let mut suppressed = Vec::new();
+
+    if let Some(pinned_transport) = pinned {
+        if transport_disabled_by_policy(policy, pinned_transport) {
+            return TransportPlan {
+                attempts: Vec::new(),
+                suppressed_candidates: vec![pinned_transport],
+                winner_layer: DecisionWinnerLayer::AppPolicy,
+                reason_code: "pinned_transport_disabled",
+            };
+        }
+        return TransportPlan {
+            attempts: vec![(pinned_transport, 0)],
+            suppressed_candidates: base_order
+                .into_iter()
+                .filter(|candidate| *candidate != pinned_transport)
+                .collect(),
+            winner_layer: DecisionWinnerLayer::UserCommand,
+            reason_code: "user_pin_transport",
+        };
+    }
+
+    let mut allowed = Vec::new();
+    for transport in base_order {
+        if transport_disabled_by_policy(policy, transport) {
+            suppressed.push(transport);
+            continue;
+        }
+        let delay_ms = transport_start_delay_ms(config, transport, allowed.len());
+        allowed.push((transport, delay_ms));
+    }
+
+    if allowed.is_empty() {
+        return TransportPlan {
+            attempts: Vec::new(),
+            suppressed_candidates: suppressed,
+            winner_layer: DecisionWinnerLayer::AppPolicy,
+            reason_code: "all_transports_blocked_by_policy",
+        };
+    }
+
+    let winner_layer = if suppressed.is_empty() {
+        DecisionWinnerLayer::AdaptiveScheduler
+    } else {
+        DecisionWinnerLayer::AppPolicy
+    };
+    let reason_code = if suppressed.is_empty() {
+        "adaptive_transport_plan"
+    } else {
+        "policy_disabled_transports"
+    };
+
+    TransportPlan {
+        attempts: allowed,
+        suppressed_candidates: suppressed,
+        winner_layer,
+        reason_code,
+    }
+}
+
+fn emit_scheduler_state(app: &dyn ClientApp, state: SchedulerState, reason_code: &str) {
+    let _ = app.on_event(ClientEvent::SchedulerStateChanged {
+        state,
+        reason_code: reason_code.to_string(),
+    });
+}
+
+fn emit_decision_trace(
+    app: &dyn ClientApp,
+    decision_id: u64,
+    winner_layer: DecisionWinnerLayer,
+    reason_code: &str,
+    selected_transport: Option<TransportKind>,
+    suppressed_candidates: Vec<TransportKind>,
+    inputs_digest: String,
+) {
+    let trace = DecisionTrace {
+        decision_id,
+        winner_layer,
+        reason_code: reason_code.to_string(),
+        selected_transport,
+        inputs_digest,
+        suppressed_candidates,
+    };
+    let _ = app.on_event(ClientEvent::DecisionTrace { trace });
+}
+
+struct HealthTracker {
+    recv_total: u64,
+    recv_timeout: u64,
+    ack_total: u64,
+    ack_non_ok: u64,
+    last_progress_at: Instant,
+    rtt_ewma_ms: Option<f64>,
+    rtt_jitter_ewma_ms: Option<f64>,
+    last_probe_rtt_ms: Option<u64>,
+}
+
+impl HealthTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            recv_total: 0,
+            recv_timeout: 0,
+            ack_total: 0,
+            ack_non_ok: 0,
+            last_progress_at: now,
+            rtt_ewma_ms: None,
+            rtt_jitter_ewma_ms: None,
+            last_probe_rtt_ms: None,
+        }
+    }
+
+    fn note_timeout(&mut self) {
+        self.recv_total = self.recv_total.saturating_add(1);
+        self.recv_timeout = self.recv_timeout.saturating_add(1);
+    }
+
+    fn note_frame_progress(&mut self, now: Instant) {
+        self.recv_total = self.recv_total.saturating_add(1);
+        self.last_progress_at = now;
+    }
+
+    fn note_ack(&mut self, status: AckStatus, now: Instant) {
+        self.ack_total = self.ack_total.saturating_add(1);
+        if status != AckStatus::Ok {
+            self.ack_non_ok = self.ack_non_ok.saturating_add(1);
+        }
+        self.last_progress_at = now;
+    }
+
+    fn note_probe_rtt(&mut self, rtt_ms: u64) {
+        let sample = rtt_ms as f64;
+        let alpha = 0.2;
+        let next_ewma = self
+            .rtt_ewma_ms
+            .map(|prev| prev + alpha * (sample - prev))
+            .unwrap_or(sample);
+        let jitter_sample = self
+            .last_probe_rtt_ms
+            .map(|prev| prev.abs_diff(rtt_ms) as f64)
+            .unwrap_or(0.0);
+        let next_jitter = self
+            .rtt_jitter_ewma_ms
+            .map(|prev| prev + alpha * (jitter_sample - prev))
+            .unwrap_or(jitter_sample);
+        self.rtt_ewma_ms = Some(next_ewma);
+        self.rtt_jitter_ewma_ms = Some(next_jitter);
+        self.last_probe_rtt_ms = Some(rtt_ms);
+    }
+
+    fn snapshot(&self, now: Instant) -> warp_link_core::TransportHealthSnapshot {
+        let timeout_rate = if self.recv_total == 0 {
+            None
+        } else {
+            Some((self.recv_timeout as f32) / (self.recv_total as f32))
+        };
+        let ack_non_ok_ratio = if self.ack_total == 0 {
+            None
+        } else {
+            Some((self.ack_non_ok as f32) / (self.ack_total as f32))
+        };
+        warp_link_core::TransportHealthSnapshot {
+            timeout_rate,
+            ack_non_ok_ratio,
+            dead_air_secs: Some(
+                now.saturating_duration_since(self.last_progress_at)
+                    .as_secs(),
+            ),
+            rtt_ewma_ms: self.rtt_ewma_ms.map(|v| v as u64),
+            rtt_jitter_ms: self.rtt_jitter_ewma_ms.map(|v| v as u64),
+        }
+    }
+}
+
+struct MobilityTracker {
+    enabled: bool,
+    active: bool,
+    volatility_score: u8,
+    last_signal_at: Instant,
+    last_probe_rtt_ms: Option<u64>,
+}
+
+impl MobilityTracker {
+    fn new(now: Instant, enabled: bool) -> Self {
+        Self {
+            enabled,
+            active: false,
+            volatility_score: 0,
+            last_signal_at: now,
+            last_probe_rtt_ms: None,
+        }
+    }
+
+    fn note_timeout(&mut self, now: Instant) {
+        self.note_signal(now, 1);
+    }
+
+    fn note_disconnect(&mut self, now: Instant) {
+        self.note_signal(now, 1);
+    }
+
+    fn note_probe_rtt(&mut self, now: Instant, rtt_ms: u64) {
+        if let Some(last) = self.last_probe_rtt_ms
+            && last.abs_diff(rtt_ms) >= 120
+        {
+            self.note_signal(now, 1);
+        }
+        self.last_probe_rtt_ms = Some(rtt_ms);
+    }
+
+    fn in_mode(&mut self, now: Instant) -> bool {
+        if !self.enabled {
+            self.active = false;
+            self.volatility_score = 0;
+            return false;
+        }
+        if now.saturating_duration_since(self.last_signal_at) > Duration::from_secs(120) {
+            self.active = false;
+            self.volatility_score = 0;
+        } else if self.volatility_score >= 3 {
+            self.active = true;
+        }
+        self.active
+    }
+
+    fn note_signal(&mut self, now: Instant, weight: u8) {
+        if now.saturating_duration_since(self.last_signal_at) > Duration::from_secs(60) {
+            self.volatility_score = weight.min(8);
+        } else {
+            self.volatility_score = self.volatility_score.saturating_add(weight).min(8);
+        }
+        self.last_signal_at = now;
+    }
+}
+
+fn health_gate_passes(
+    policy: &warp_link_core::ClientPolicy,
+    snapshot: &warp_link_core::TransportHealthSnapshot,
+) -> bool {
+    if let Some(timeout_rate) = snapshot.timeout_rate
+        && timeout_rate > policy.health_timeout_rate_threshold
+    {
+        return false;
+    }
+    if let Some(ack_non_ok_ratio) = snapshot.ack_non_ok_ratio
+        && ack_non_ok_ratio > policy.health_ack_non_ok_ratio_threshold
+    {
+        return false;
+    }
+    if let Some(dead_air_secs) = snapshot.dead_air_secs
+        && dead_air_secs > u64::from(policy.health_dead_air_secs)
+    {
+        return false;
+    }
+    true
+}
+
+fn stability_score(snapshot: &warp_link_core::TransportHealthSnapshot) -> f64 {
+    let timeout_penalty = snapshot.timeout_rate.unwrap_or(0.0).min(1.0) as f64 * 45.0;
+    let ack_penalty = snapshot.ack_non_ok_ratio.unwrap_or(0.0).min(1.0) as f64 * 35.0;
+    let dead_air_penalty = snapshot.dead_air_secs.unwrap_or(0).min(60) as f64 * 0.4;
+    (100.0 - timeout_penalty - ack_penalty - dead_air_penalty).clamp(0.0, 100.0)
+}
+
+fn performance_score(
+    transport: TransportKind,
+    connect_elapsed_ms: Option<u64>,
+    snapshot: &warp_link_core::TransportHealthSnapshot,
+) -> f64 {
+    let transport_base = match transport {
+        TransportKind::Quic => 86.0,
+        TransportKind::Tcp => 74.0,
+        TransportKind::Wss => 62.0,
+    };
+    let rtt_penalty = snapshot.rtt_ewma_ms.unwrap_or(0).min(800) as f64 * 0.04;
+    let jitter_penalty = snapshot.rtt_jitter_ms.unwrap_or(0).min(400) as f64 * 0.03;
+    let connect_bonus = connect_elapsed_ms
+        .map(|value| (130.0 - (value.min(4_000) as f64 / 45.0)).clamp(0.0, 50.0))
+        .unwrap_or(12.0);
+    (transport_base + connect_bonus - rtt_penalty - jitter_penalty).clamp(0.0, 100.0)
+}
+
+fn combined_score(
+    transport: TransportKind,
+    connect_elapsed_ms: Option<u64>,
+    snapshot: &warp_link_core::TransportHealthSnapshot,
+) -> f64 {
+    let stability = stability_score(snapshot);
+    let performance = performance_score(transport, connect_elapsed_ms, snapshot);
+    (stability * 0.65) + (performance * 0.35)
+}
+
+fn required_upgrade_windows(policy: &warp_link_core::ClientPolicy, mobility_mode: bool) -> u8 {
+    if mobility_mode {
+        policy.mobility_upgrade_confirm_windows.max(1)
+    } else {
+        policy.scheduler_upgrade_confirm_windows.max(1)
+    }
+}
+
+fn effective_min_dwell_secs(policy: &warp_link_core::ClientPolicy, mobility_mode: bool) -> u16 {
+    if mobility_mode {
+        policy
+            .upgrade_probe_min_dwell_secs
+            .max(policy.mobility_min_dwell_secs)
+            .max(1)
+    } else {
+        policy.upgrade_probe_min_dwell_secs.max(1)
+    }
+}
+
+fn purge_old_migrations(history: &mut VecDeque<Instant>, now: Instant) {
+    while let Some(front) = history.front().copied() {
+        if now.saturating_duration_since(front) > Duration::from_secs(300) {
+            let _ = history.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn migration_blocked_by_cooldown(
+    history: &mut VecDeque<Instant>,
+    cooldown_until: &mut Option<Instant>,
+    now: Instant,
+    policy: &warp_link_core::ClientPolicy,
+) -> bool {
+    purge_old_migrations(history, now);
+    if cooldown_until.is_some_and(|until| now < until) {
+        return true;
+    }
+    if history.len() >= usize::from(policy.scheduler_max_migrations_per_5m.max(1)) {
+        *cooldown_until =
+            Some(now + Duration::from_secs(u64::from(policy.scheduler_cooldown_secs.max(1))));
+        return true;
+    }
+    false
 }
 
 pub async fn client_run(config: ClientConfig, app: impl ClientApp) -> Result<(), WarpLinkError> {
@@ -168,8 +577,74 @@ async fn run_client_session_once(
     app: Arc<dyn ClientApp>,
     continuity: &mut ClientContinuityState,
 ) -> Result<(), WarpLinkError> {
-    let (mut transport, mut io) = hedged_connect(config).await?;
+    let mut decision_id_seq: u64 = 1;
+    if config.policy.scheduler_v2_enabled {
+        emit_scheduler_state(
+            app.as_ref(),
+            SchedulerState::PrimaryConnecting,
+            "session_start",
+        );
+    }
+    let initial_policy = if config.policy.scheduler_v2_enabled {
+        app.scheduler_policy()
+    } else {
+        PolicyInput::default()
+    };
+    let connect_plan = build_transport_plan(config, &initial_policy);
+    if connect_plan.attempts.is_empty() {
+        if config.policy.scheduler_v2_enabled {
+            emit_scheduler_state(
+                app.as_ref(),
+                SchedulerState::BlockedByPolicy,
+                connect_plan.reason_code,
+            );
+            emit_decision_trace(
+                app.as_ref(),
+                decision_id_seq,
+                connect_plan.winner_layer,
+                connect_plan.reason_code,
+                None,
+                connect_plan.suppressed_candidates.clone(),
+                format!(
+                    "force_reconnect_nonce={} pinned={} disabled_count={}",
+                    initial_policy.force_reconnect_nonce,
+                    pinned_transport_active(&initial_policy)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    initial_policy.disabled_transports.len()
+                ),
+            );
+        }
+        return Err(WarpLinkError::Unsupported(
+            "all transports blocked by scheduler policy".to_string(),
+        ));
+    }
+    let (mut transport, mut io) = hedged_connect(config, &connect_plan).await?;
+    emit_decision_trace(
+        app.as_ref(),
+        decision_id_seq,
+        connect_plan.winner_layer,
+        connect_plan.reason_code,
+        Some(transport),
+        connect_plan.suppressed_candidates.clone(),
+        format!(
+            "force_reconnect_nonce={} pinned={} disabled_count={}",
+            initial_policy.force_reconnect_nonce,
+            pinned_transport_active(&initial_policy)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            initial_policy.disabled_transports.len()
+        ),
+    );
+    decision_id_seq = decision_id_seq.saturating_add(1);
     let _ = app.on_event(ClientEvent::Connected { transport });
+    if config.policy.scheduler_v2_enabled {
+        emit_scheduler_state(
+            app.as_ref(),
+            SchedulerState::PrimaryActive,
+            "primary_connected",
+        );
+    }
 
     let mut power_runtime = ClientPowerRuntime::new(Instant::now());
     let mut hello = build_effective_hello(config, app.as_ref(), &mut power_runtime);
@@ -203,8 +678,21 @@ async fn run_client_session_once(
     let mut last_idle_ping_at = Instant::now();
     let mut pending_ping_sent_at: Option<Instant> = None;
     let mut pending_ping_source: Option<ProbeRttSource> = None;
+    let mut health_tracker = HealthTracker::new(Instant::now());
+    let mut mobility_tracker = MobilityTracker::new(Instant::now(), config.policy.mobility_enabled);
+    let mut adaptive_upgrade_streak: u8 = 0;
+    let mut migration_history: VecDeque<Instant> = VecDeque::new();
+    let mut migration_cooldown_until: Option<Instant> = None;
     let mut upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
-    upgrade_probe_runtime.schedule_next(config, app.as_ref(), &power_runtime, Instant::now());
+    let mobility_mode = mobility_tracker.in_mode(Instant::now());
+    upgrade_probe_runtime.schedule_next(
+        config,
+        app.as_ref(),
+        &power_runtime,
+        Instant::now(),
+        mobility_mode,
+    );
+    let last_force_reconnect_nonce = initial_policy.force_reconnect_nonce;
 
     loop {
         maybe_send_inband_hello_update(
@@ -216,6 +704,97 @@ async fn run_client_session_once(
             continuity,
         )
         .await?;
+        if config.policy.scheduler_v2_enabled {
+            let policy_input = app.scheduler_policy();
+            if policy_input.force_reconnect_nonce != last_force_reconnect_nonce {
+                emit_decision_trace(
+                    app.as_ref(),
+                    decision_id_seq,
+                    DecisionWinnerLayer::UserCommand,
+                    "force_reconnect",
+                    Some(transport),
+                    Vec::new(),
+                    format!(
+                        "force_reconnect_nonce={} current_transport={}",
+                        policy_input.force_reconnect_nonce, transport
+                    ),
+                );
+                emit_scheduler_state(
+                    app.as_ref(),
+                    SchedulerState::Recovering,
+                    "force_reconnect_requested",
+                );
+                return Ok(());
+            }
+            if transport_disabled_by_policy(&policy_input, transport) {
+                emit_decision_trace(
+                    app.as_ref(),
+                    decision_id_seq,
+                    DecisionWinnerLayer::AppPolicy,
+                    "current_transport_disabled_by_policy",
+                    Some(transport),
+                    vec![transport],
+                    format!("current_transport={} disabled=1", transport),
+                );
+                emit_scheduler_state(
+                    app.as_ref(),
+                    SchedulerState::Recovering,
+                    "policy_transport_blocked",
+                );
+                return Ok(());
+            }
+            if let Some(pinned_transport) = pinned_transport_active(&policy_input)
+                && pinned_transport != transport
+                && continuity.can_switch_without_loss()
+            {
+                emit_decision_trace(
+                    app.as_ref(),
+                    decision_id_seq,
+                    DecisionWinnerLayer::UserCommand,
+                    "pin_transport_requires_cutover",
+                    Some(pinned_transport),
+                    vec![transport],
+                    format!("from={} to={}", transport, pinned_transport),
+                );
+                if let Some(candidate_io) = connect_transport(config, pinned_transport).await.ok()
+                    && let Some(candidate_welcome) = commit_candidate_cutover(
+                        config,
+                        Arc::clone(&app),
+                        continuity,
+                        &mut power_runtime,
+                        &mut transport,
+                        &mut io,
+                        pinned_transport,
+                        candidate_io,
+                        decision_id_seq,
+                    )
+                    .await?
+                {
+                    continuity.note_welcome(candidate_welcome.resume_token.as_deref());
+                    idle_timeout_ms =
+                        u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
+                    idle_timeout_streak = 0;
+                    last_idle_ping_at = Instant::now();
+                    inband_hello_snapshot =
+                        build_effective_hello(config, app.as_ref(), &mut power_runtime);
+                    continuity.apply_to_hello(&mut inband_hello_snapshot);
+                    upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
+                    let mobility_mode = mobility_tracker.in_mode(Instant::now());
+                    upgrade_probe_runtime.schedule_next(
+                        config,
+                        app.as_ref(),
+                        &power_runtime,
+                        Instant::now(),
+                        mobility_mode,
+                    );
+                    purge_old_migrations(&mut migration_history, Instant::now());
+                    migration_history.push_back(Instant::now());
+                    decision_id_seq = decision_id_seq.saturating_add(1);
+                    continue;
+                }
+                decision_id_seq = decision_id_seq.saturating_add(1);
+            }
+        }
         if app.take_probe_request() && pending_ping_sent_at.is_none() {
             let ping = config.wire_profile.encode_client_ping();
             io.send_frame(&ping, config.policy.write_timeout_ms).await?;
@@ -223,59 +802,168 @@ async fn run_client_session_once(
             pending_ping_source = Some(ProbeRttSource::Manual);
         }
         let now = Instant::now();
-        let recv_timeout_ms = next_recv_timeout_ms(config, &upgrade_probe_runtime, now)
-            .unwrap_or(idle_timeout_ms)
-            .min(idle_timeout_ms)
-            .max(1);
+        let mobility_mode = mobility_tracker.in_mode(now);
+        let recv_timeout_ms =
+            next_recv_timeout_ms(config, &upgrade_probe_runtime, now, mobility_mode)
+                .unwrap_or(idle_timeout_ms)
+                .min(idle_timeout_ms)
+                .max(1);
         let frame = match io.recv_frame(recv_timeout_ms).await {
             Ok(frame) => {
                 idle_timeout_streak = 0;
                 last_idle_ping_at = Instant::now();
+                health_tracker.note_frame_progress(Instant::now());
                 frame
             }
             Err(WarpLinkError::Timeout(_)) => {
                 let now = Instant::now();
-                if upgrade_probe_runtime.should_probe(config, now) {
+                health_tracker.note_timeout();
+                mobility_tracker.note_timeout(now);
+                if upgrade_probe_runtime.should_probe(config, now, mobility_mode) {
                     if continuity.can_switch_without_loss() {
-                        if let Some((target, mut candidate_io)) =
-                            probe_higher_priority_transport(config, transport).await
-                            && let Ok(candidate_welcome) = initialize_candidate_transport(
-                                config,
-                                app.as_ref(),
-                                continuity,
-                                &mut power_runtime,
-                                &mut candidate_io,
-                            )
-                            .await
-                        {
-                            continuity.note_welcome(candidate_welcome.resume_token.as_deref());
-                            let reason = format!("transport_upgrade:{transport}->{target}");
-                            let _ = app.on_event(ClientEvent::Disconnected { transport, reason });
-                            transport = target;
-                            io = candidate_io;
-                            idle_timeout_ms =
-                                u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
-                                    * 1_000;
-                            idle_timeout_streak = 0;
-                            last_idle_ping_at = Instant::now();
-                            inband_hello_snapshot =
-                                build_effective_hello(config, app.as_ref(), &mut power_runtime);
-                            continuity.apply_to_hello(&mut inband_hello_snapshot);
-                            upgrade_probe_runtime =
-                                UpgradeProbeRuntime::new(transport, Instant::now());
-                            upgrade_probe_runtime.schedule_next(
-                                config,
-                                app.as_ref(),
-                                &power_runtime,
-                                Instant::now(),
+                        let policy_input = if config.policy.scheduler_v2_enabled {
+                            app.scheduler_policy()
+                        } else {
+                            PolicyInput::default()
+                        };
+                        let probe_started_at = Instant::now();
+                        let probe_candidate =
+                            probe_higher_priority_transport(config, transport, &policy_input).await;
+                        if let Some((target, candidate_io)) = probe_candidate {
+                            let candidate_connect_elapsed_ms = duration_ms(
+                                Instant::now().saturating_duration_since(probe_started_at),
                             );
-                            continue;
+                            let primary_snapshot = health_tracker.snapshot(now);
+                            let candidate_snapshot = warp_link_core::TransportHealthSnapshot {
+                                timeout_rate: Some(0.0),
+                                ack_non_ok_ratio: Some(0.0),
+                                dead_air_secs: Some(0),
+                                rtt_ewma_ms: Some(candidate_connect_elapsed_ms),
+                                rtt_jitter_ms: Some(0),
+                            };
+                            let gate_ok = health_gate_passes(&config.policy, &primary_snapshot)
+                                && health_gate_passes(&config.policy, &candidate_snapshot);
+                            let primary_score = combined_score(transport, None, &primary_snapshot);
+                            let candidate_score = combined_score(
+                                target,
+                                Some(candidate_connect_elapsed_ms),
+                                &candidate_snapshot,
+                            );
+                            let required_margin = 1.0
+                                + (f64::from(config.policy.scheduler_hysteresis_percent) / 100.0);
+                            let beats =
+                                gate_ok && candidate_score >= (primary_score * required_margin);
+                            if beats {
+                                adaptive_upgrade_streak = adaptive_upgrade_streak.saturating_add(1);
+                            } else {
+                                adaptive_upgrade_streak = 0;
+                            }
+                            let required_windows =
+                                required_upgrade_windows(&config.policy, mobility_mode);
+                            if adaptive_upgrade_streak >= required_windows {
+                                if migration_blocked_by_cooldown(
+                                    &mut migration_history,
+                                    &mut migration_cooldown_until,
+                                    now,
+                                    &config.policy,
+                                ) {
+                                    emit_decision_trace(
+                                        app.as_ref(),
+                                        decision_id_seq,
+                                        DecisionWinnerLayer::AdaptiveScheduler,
+                                        "migration_cooldown_active",
+                                        Some(target),
+                                        Vec::new(),
+                                        format!(
+                                            "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                            primary_score,
+                                            candidate_score,
+                                            adaptive_upgrade_streak,
+                                            required_windows
+                                        ),
+                                    );
+                                    adaptive_upgrade_streak = 0;
+                                } else if let Some(candidate_welcome) = commit_candidate_cutover(
+                                    config,
+                                    Arc::clone(&app),
+                                    continuity,
+                                    &mut power_runtime,
+                                    &mut transport,
+                                    &mut io,
+                                    target,
+                                    candidate_io,
+                                    decision_id_seq,
+                                )
+                                .await?
+                                {
+                                    emit_decision_trace(
+                                        app.as_ref(),
+                                        decision_id_seq,
+                                        DecisionWinnerLayer::AdaptiveScheduler,
+                                        "adaptive_upgrade_probe",
+                                        Some(target),
+                                        Vec::new(),
+                                        format!(
+                                            "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                            primary_score,
+                                            candidate_score,
+                                            adaptive_upgrade_streak,
+                                            required_windows
+                                        ),
+                                    );
+                                    continuity
+                                        .note_welcome(candidate_welcome.resume_token.as_deref());
+                                    idle_timeout_ms = u64::from(
+                                        candidate_welcome.ping_interval_secs.clamp(5, 30),
+                                    ) * 1_000;
+                                    idle_timeout_streak = 0;
+                                    last_idle_ping_at = Instant::now();
+                                    inband_hello_snapshot = build_effective_hello(
+                                        config,
+                                        app.as_ref(),
+                                        &mut power_runtime,
+                                    );
+                                    continuity.apply_to_hello(&mut inband_hello_snapshot);
+                                    upgrade_probe_runtime =
+                                        UpgradeProbeRuntime::new(transport, Instant::now());
+                                    let mobility_mode = mobility_tracker.in_mode(Instant::now());
+                                    upgrade_probe_runtime.schedule_next(
+                                        config,
+                                        app.as_ref(),
+                                        &power_runtime,
+                                        Instant::now(),
+                                        mobility_mode,
+                                    );
+                                    purge_old_migrations(&mut migration_history, Instant::now());
+                                    migration_history.push_back(Instant::now());
+                                    adaptive_upgrade_streak = 0;
+                                    decision_id_seq = decision_id_seq.saturating_add(1);
+                                    continue;
+                                }
+                            } else {
+                                emit_decision_trace(
+                                    app.as_ref(),
+                                    decision_id_seq,
+                                    DecisionWinnerLayer::AdaptiveScheduler,
+                                    "hysteresis_wait",
+                                    Some(target),
+                                    Vec::new(),
+                                    format!(
+                                        "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                        primary_score,
+                                        candidate_score,
+                                        adaptive_upgrade_streak,
+                                        required_windows
+                                    ),
+                                );
+                            }
                         }
                         upgrade_probe_runtime.note_probe_failure(
                             config,
                             app.as_ref(),
                             &power_runtime,
                             now,
+                            mobility_mode,
                         );
                     } else {
                         upgrade_probe_runtime.note_probe_skip(
@@ -283,6 +971,7 @@ async fn run_client_session_once(
                             app.as_ref(),
                             &power_runtime,
                             now,
+                            mobility_mode,
                         );
                     }
                 }
@@ -291,6 +980,73 @@ async fn run_client_session_once(
                     >= Duration::from_millis(idle_timeout_ms)
                 {
                     idle_timeout_streak = idle_timeout_streak.saturating_add(1);
+                    let dead_air_secs = health_tracker
+                        .snapshot(now)
+                        .dead_air_secs
+                        .unwrap_or_default();
+                    if idle_timeout_streak >= 3
+                        && dead_air_secs >= u64::from(config.policy.health_dead_air_secs)
+                        && upgrade_probe_runtime.probe_failure_streak
+                            >= config.policy.dead_connection_probe_failure_threshold
+                    {
+                        let _ = app.on_event(ClientEvent::DeadConnectionDetected {
+                            transport,
+                            reason_code: "multi_signal_dead_connection".to_string(),
+                        });
+                        let _ = app.on_event(ClientEvent::RecoveryTierEntered {
+                            tier: 1,
+                            reason_code: "same_transport_rehandshake".to_string(),
+                        });
+                        if continuity.can_switch_without_loss() {
+                            let policy_input = if config.policy.scheduler_v2_enabled {
+                                app.scheduler_policy()
+                            } else {
+                                PolicyInput::default()
+                            };
+                            let alternate =
+                                probe_alternate_transport(config, transport, &policy_input).await;
+                            if let Some((target, candidate_io)) = alternate
+                                && let Some(candidate_welcome) = commit_candidate_cutover(
+                                    config,
+                                    Arc::clone(&app),
+                                    continuity,
+                                    &mut power_runtime,
+                                    &mut transport,
+                                    &mut io,
+                                    target,
+                                    candidate_io,
+                                    decision_id_seq,
+                                )
+                                .await?
+                            {
+                                let _ = app.on_event(ClientEvent::RecoveryTierEntered {
+                                    tier: 2,
+                                    reason_code: "alternate_transport_recovery".to_string(),
+                                });
+                                continuity.note_welcome(candidate_welcome.resume_token.as_deref());
+                                idle_timeout_ms =
+                                    u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
+                                        * 1_000;
+                                idle_timeout_streak = 0;
+                                last_idle_ping_at = Instant::now();
+                                inband_hello_snapshot =
+                                    build_effective_hello(config, app.as_ref(), &mut power_runtime);
+                                continuity.apply_to_hello(&mut inband_hello_snapshot);
+                                upgrade_probe_runtime =
+                                    UpgradeProbeRuntime::new(transport, Instant::now());
+                                let mobility_mode = mobility_tracker.in_mode(Instant::now());
+                                upgrade_probe_runtime.schedule_next(
+                                    config,
+                                    app.as_ref(),
+                                    &power_runtime,
+                                    Instant::now(),
+                                    mobility_mode,
+                                );
+                                continue;
+                            }
+                        }
+                        return Ok(());
+                    }
                     if idle_timeout_streak >= 4 {
                         let _ = app.on_event(ClientEvent::Disconnected {
                             transport,
@@ -309,6 +1065,7 @@ async fn run_client_session_once(
                 continue;
             }
             Err(err) => {
+                mobility_tracker.note_disconnect(Instant::now());
                 let _ = app.on_event(ClientEvent::Disconnected {
                     transport,
                     reason: err.to_string(),
@@ -317,78 +1074,330 @@ async fn run_client_session_once(
             }
         };
 
-        match config.wire_profile.decode_server_frame(&frame)? {
-            DecodedServerFrame::Deliver(msg) => {
-                power_runtime.note_message(&config.policy.power, Instant::now());
-                let decision = app.on_event(ClientEvent::Message {
-                    transport,
-                    msg: msg.clone(),
-                });
-                let status = match decision {
-                    AppDecision::AckOk => Some(AckStatus::Ok),
-                    AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
-                    AppDecision::Ignore => None,
-                };
-                if let Some(status) = status {
-                    let ack = AckMsg {
-                        seq: msg.seq,
-                        id: msg.id,
-                        status,
-                    };
-                    let bytes = config.wire_profile.encode_client_ack(&ack)?;
-                    io.send_frame(&bytes, config.policy.write_timeout_ms)
-                        .await?;
-                    continuity.note_acked_seq(msg.seq);
-                }
-            }
-            DecodedServerFrame::Ping => {
-                let pong = config.wire_profile.encode_client_pong();
-                io.send_frame(&pong, config.policy.write_timeout_ms).await?;
-            }
-            DecodedServerFrame::Pong => {
-                if let Some(sent_at) = pending_ping_sent_at.take() {
-                    let source = pending_ping_source.take().unwrap_or(ProbeRttSource::Manual);
-                    let rtt_ms = Instant::now()
-                        .saturating_duration_since(sent_at)
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX);
-                    let _ = app.on_event(ClientEvent::ProbeRtt {
-                        transport,
-                        rtt_ms,
-                        source,
-                    });
-                }
-            }
-            DecodedServerFrame::GoAway(reason) => {
-                let goaway_reason = reason.unwrap_or_else(|| "goaway".to_string());
-                let _ = app.on_event(ClientEvent::Disconnected {
-                    transport,
-                    reason: goaway_reason.clone(),
-                });
-                if goaway_reason.starts_with("auth_expired")
-                    || goaway_reason.starts_with("auth_revoked")
-                {
-                    return Err(WarpLinkError::Auth(AuthError::Unauthorized(goaway_reason)));
-                }
-                if goaway_reason.starts_with("auth_refresh_required") {
-                    return Ok(());
-                }
-                return Ok(());
-            }
-            DecodedServerFrame::Error { code, message } => {
-                return Err(WarpLinkError::Protocol(format!(
-                    "gateway error: {code} {message}"
-                )));
-            }
-            DecodedServerFrame::Welcome(_) => {
-                return Err(WarpLinkError::Protocol(
-                    "unexpected welcome frame after handshake".to_string(),
-                ));
-            }
-            DecodedServerFrame::Unknown => {}
+        let control = handle_primary_frame(
+            config,
+            app.as_ref(),
+            continuity,
+            &mut power_runtime,
+            &mut io,
+            transport,
+            frame,
+            &mut pending_ping_sent_at,
+            &mut pending_ping_source,
+            &mut health_tracker,
+            &mut mobility_tracker,
+        )
+        .await?;
+        if matches!(control, FrameLoopControl::TerminateOk) {
+            return Ok(());
         }
     }
+}
+
+enum FrameLoopControl {
+    Continue,
+    TerminateOk,
+}
+
+async fn handle_primary_frame(
+    config: &ClientConfig,
+    app: &dyn ClientApp,
+    continuity: &mut ClientContinuityState,
+    power_runtime: &mut ClientPowerRuntime,
+    io: &mut ClientIo,
+    transport: TransportKind,
+    frame: Vec<u8>,
+    pending_ping_sent_at: &mut Option<Instant>,
+    pending_ping_source: &mut Option<ProbeRttSource>,
+    health_tracker: &mut HealthTracker,
+    mobility_tracker: &mut MobilityTracker,
+) -> Result<FrameLoopControl, WarpLinkError> {
+    match config.wire_profile.decode_server_frame(&frame)? {
+        DecodedServerFrame::Deliver(msg) => {
+            power_runtime.note_message(&config.policy.power, Instant::now());
+            health_tracker.note_frame_progress(Instant::now());
+            let decision = app.on_event(ClientEvent::Message {
+                transport,
+                msg: msg.clone(),
+            });
+            let status = match decision {
+                AppDecision::AckOk => Some(AckStatus::Ok),
+                AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
+                AppDecision::Ignore => None,
+            };
+            if let Some(status) = status {
+                let ack = AckMsg {
+                    seq: msg.seq,
+                    id: msg.id,
+                    status,
+                };
+                let bytes = config.wire_profile.encode_client_ack(&ack)?;
+                io.send_frame(&bytes, config.policy.write_timeout_ms)
+                    .await?;
+                continuity.note_acked_seq(msg.seq);
+                health_tracker.note_ack(status, Instant::now());
+            }
+            Ok(FrameLoopControl::Continue)
+        }
+        DecodedServerFrame::Ping => {
+            health_tracker.note_frame_progress(Instant::now());
+            let pong = config.wire_profile.encode_client_pong();
+            io.send_frame(&pong, config.policy.write_timeout_ms).await?;
+            Ok(FrameLoopControl::Continue)
+        }
+        DecodedServerFrame::Pong => {
+            health_tracker.note_frame_progress(Instant::now());
+            if let Some(sent_at) = pending_ping_sent_at.take() {
+                let source = pending_ping_source.take().unwrap_or(ProbeRttSource::Manual);
+                let rtt_ms = Instant::now()
+                    .saturating_duration_since(sent_at)
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                health_tracker.note_probe_rtt(rtt_ms);
+                mobility_tracker.note_probe_rtt(Instant::now(), rtt_ms);
+                let _ = app.on_event(ClientEvent::ProbeRtt {
+                    transport,
+                    rtt_ms,
+                    source,
+                });
+            }
+            Ok(FrameLoopControl::Continue)
+        }
+        DecodedServerFrame::GoAway(reason) => {
+            mobility_tracker.note_disconnect(Instant::now());
+            let goaway_reason = reason.unwrap_or_else(|| "goaway".to_string());
+            let _ = app.on_event(ClientEvent::Disconnected {
+                transport,
+                reason: goaway_reason.clone(),
+            });
+            if goaway_reason.starts_with("auth_expired")
+                || goaway_reason.starts_with("auth_revoked")
+            {
+                return Err(WarpLinkError::Auth(AuthError::Unauthorized(goaway_reason)));
+            }
+            if goaway_reason.starts_with("auth_refresh_required") {
+                return Ok(FrameLoopControl::TerminateOk);
+            }
+            Ok(FrameLoopControl::TerminateOk)
+        }
+        DecodedServerFrame::Error { code, message } => Err(WarpLinkError::Protocol(format!(
+            "gateway error: {code} {message}"
+        ))),
+        DecodedServerFrame::Welcome(_) => Err(WarpLinkError::Protocol(
+            "unexpected welcome frame after handshake".to_string(),
+        )),
+        DecodedServerFrame::Unknown => Ok(FrameLoopControl::Continue),
+    }
+}
+
+async fn commit_candidate_cutover(
+    config: &ClientConfig,
+    app: Arc<dyn ClientApp>,
+    continuity: &mut ClientContinuityState,
+    power_runtime: &mut ClientPowerRuntime,
+    transport: &mut TransportKind,
+    io: &mut ClientIo,
+    target: TransportKind,
+    mut candidate_io: ClientIo,
+    decision_id: u64,
+) -> Result<Option<warp_link_core::WelcomeMsg>, WarpLinkError> {
+    let from_transport = *transport;
+    emit_scheduler_state(
+        app.as_ref(),
+        SchedulerState::CandidateConnecting,
+        "candidate_connecting",
+    );
+    let _ = app.on_event(ClientEvent::CandidateStarted {
+        from: from_transport,
+        to: target,
+        decision_id,
+    });
+    let candidate_welcome = match initialize_candidate_transport(
+        config,
+        app.as_ref(),
+        continuity,
+        power_runtime,
+        &mut candidate_io,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            emit_scheduler_state(
+                app.as_ref(),
+                SchedulerState::PrimaryActive,
+                "candidate_failed_precommit",
+            );
+            return Ok(None);
+        }
+    };
+
+    emit_scheduler_state(
+        app.as_ref(),
+        SchedulerState::CutoverReady,
+        "candidate_ready",
+    );
+    let _ = app.on_event(ClientEvent::CandidateReady {
+        from: from_transport,
+        to: target,
+        decision_id,
+    });
+    let old_io = std::mem::replace(io, candidate_io);
+    *transport = target;
+    emit_scheduler_state(
+        app.as_ref(),
+        SchedulerState::DrainingOld,
+        "cutover_committed",
+    );
+    let _ = app.on_event(ClientEvent::CutoverCommitted {
+        from: from_transport,
+        to: target,
+        decision_id,
+    });
+
+    if let Err(err) = cutover_guard(config, app.as_ref(), continuity, io, target).await {
+        let _ = app.on_event(ClientEvent::CutoverRollback {
+            restored: from_transport,
+            failed: target,
+            decision_id,
+            reason: err.to_string(),
+        });
+        emit_scheduler_state(
+            app.as_ref(),
+            SchedulerState::Recovering,
+            "cutover_guard_failed",
+        );
+        let _failed_io = std::mem::replace(io, old_io);
+        *transport = from_transport;
+        return Ok(None);
+    }
+
+    spawn_old_primary_drain(config.clone(), Arc::clone(&app), from_transport, old_io);
+    emit_scheduler_state(
+        app.as_ref(),
+        SchedulerState::PrimaryActive,
+        "cutover_completed",
+    );
+    Ok(Some(candidate_welcome))
+}
+
+async fn cutover_guard(
+    config: &ClientConfig,
+    app: &dyn ClientApp,
+    continuity: &mut ClientContinuityState,
+    io: &mut ClientIo,
+    transport: TransportKind,
+) -> Result<(), WarpLinkError> {
+    if config.policy.cutover_guard_ms == 0 {
+        return Ok(());
+    }
+    let ping = config.wire_profile.encode_client_ping();
+    io.send_frame(&ping, config.policy.write_timeout_ms).await?;
+    let frame = io.recv_frame(config.policy.cutover_guard_ms).await?;
+    match config.wire_profile.decode_server_frame(&frame)? {
+        DecodedServerFrame::Deliver(msg) => {
+            let decision = app.on_event(ClientEvent::Message {
+                transport,
+                msg: msg.clone(),
+            });
+            let status = match decision {
+                AppDecision::AckOk => Some(AckStatus::Ok),
+                AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
+                AppDecision::Ignore => None,
+            };
+            if let Some(status) = status {
+                let ack = AckMsg {
+                    seq: msg.seq,
+                    id: msg.id,
+                    status,
+                };
+                let bytes = config.wire_profile.encode_client_ack(&ack)?;
+                io.send_frame(&bytes, config.policy.write_timeout_ms)
+                    .await?;
+                continuity.note_acked_seq(msg.seq);
+            }
+            Ok(())
+        }
+        DecodedServerFrame::Ping => {
+            let pong = config.wire_profile.encode_client_pong();
+            io.send_frame(&pong, config.policy.write_timeout_ms).await?;
+            Ok(())
+        }
+        DecodedServerFrame::Pong | DecodedServerFrame::Unknown => Ok(()),
+        DecodedServerFrame::GoAway(reason) => Err(WarpLinkError::Protocol(format!(
+            "cutover guard goaway: {}",
+            reason.unwrap_or_else(|| "goaway".to_string())
+        ))),
+        DecodedServerFrame::Error { code, message } => Err(WarpLinkError::Protocol(format!(
+            "cutover guard gateway error: {code} {message}"
+        ))),
+        DecodedServerFrame::Welcome(_) => Err(WarpLinkError::Protocol(
+            "unexpected welcome during cutover guard".to_string(),
+        )),
+    }
+}
+
+fn spawn_old_primary_drain(
+    config: ClientConfig,
+    app: Arc<dyn ClientApp>,
+    transport: TransportKind,
+    mut io: ClientIo,
+) {
+    if config.policy.drain_timeout_ms == 0 {
+        return;
+    }
+    let drain_timeout_ms = config.policy.drain_timeout_ms;
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_millis(drain_timeout_ms);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remain_ms = duration_ms(deadline.saturating_duration_since(now)).min(400);
+            let frame = match io.recv_frame(remain_ms).await {
+                Ok(frame) => frame,
+                Err(WarpLinkError::Timeout(_)) => break,
+                Err(_) => break,
+            };
+            let decoded = match config.wire_profile.decode_server_frame(&frame) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            match decoded {
+                DecodedServerFrame::Deliver(msg) => {
+                    let decision = app.on_event(ClientEvent::Message {
+                        transport,
+                        msg: msg.clone(),
+                    });
+                    let status = match decision {
+                        AppDecision::AckOk => Some(AckStatus::Ok),
+                        AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
+                        AppDecision::Ignore => None,
+                    };
+                    if let Some(status) = status {
+                        let ack = AckMsg {
+                            seq: msg.seq,
+                            id: msg.id,
+                            status,
+                        };
+                        if let Ok(bytes) = config.wire_profile.encode_client_ack(&ack) {
+                            let _ = io.send_frame(&bytes, config.policy.write_timeout_ms).await;
+                        }
+                    }
+                }
+                DecodedServerFrame::Ping => {
+                    let pong = config.wire_profile.encode_client_pong();
+                    let _ = io.send_frame(&pong, config.policy.write_timeout_ms).await;
+                }
+                DecodedServerFrame::GoAway(_) | DecodedServerFrame::Error { .. } => break,
+                DecodedServerFrame::Pong
+                | DecodedServerFrame::Welcome(_)
+                | DecodedServerFrame::Unknown => {}
+            }
+        }
+    });
 }
 
 struct ClientPowerRuntime {
@@ -492,14 +1501,17 @@ impl UpgradeProbeRuntime {
         }
     }
 
-    fn should_probe(&self, config: &ClientConfig, now: Instant) -> bool {
+    fn should_probe(&self, config: &ClientConfig, now: Instant, mobility_mode: bool) -> bool {
         let Some(next_probe_at) = self.next_probe_at else {
             return false;
         };
         if !config.policy.upgrade_probe_enabled || !has_higher_priority_transport(self.transport) {
             return false;
         }
-        let dwell = Duration::from_secs(u64::from(config.policy.upgrade_probe_min_dwell_secs));
+        let dwell = Duration::from_secs(u64::from(effective_min_dwell_secs(
+            &config.policy,
+            mobility_mode,
+        )));
         if now.saturating_duration_since(self.connected_at) < dwell {
             return false;
         }
@@ -512,12 +1524,13 @@ impl UpgradeProbeRuntime {
         app: &dyn ClientApp,
         power_runtime: &ClientPowerRuntime,
         now: Instant,
+        mobility_mode: bool,
     ) {
         if !config.policy.upgrade_probe_enabled || !has_higher_priority_transport(self.transport) {
             self.next_probe_at = None;
             return;
         }
-        let base = upgrade_probe_interval(config, app, power_runtime, now);
+        let base = upgrade_probe_interval(config, app, power_runtime, now, mobility_mode);
         let exp = u32::from(self.probe_failure_streak.min(6));
         let mut interval = base.saturating_mul(1u32 << exp);
         let jitter_span = duration_ms(base / 4).max(1);
@@ -532,9 +1545,10 @@ impl UpgradeProbeRuntime {
         app: &dyn ClientApp,
         power_runtime: &ClientPowerRuntime,
         now: Instant,
+        mobility_mode: bool,
     ) {
         self.probe_failure_streak = self.probe_failure_streak.saturating_add(1);
-        self.schedule_next(config, app, power_runtime, now);
+        self.schedule_next(config, app, power_runtime, now, mobility_mode);
     }
 
     fn note_probe_skip(
@@ -543,8 +1557,9 @@ impl UpgradeProbeRuntime {
         app: &dyn ClientApp,
         power_runtime: &ClientPowerRuntime,
         now: Instant,
+        mobility_mode: bool,
     ) {
-        self.schedule_next(config, app, power_runtime, now);
+        self.schedule_next(config, app, power_runtime, now, mobility_mode);
     }
 }
 
@@ -648,6 +1663,7 @@ fn next_recv_timeout_ms(
     config: &ClientConfig,
     probe_runtime: &UpgradeProbeRuntime,
     now: Instant,
+    mobility_mode: bool,
 ) -> Option<u64> {
     let next_probe_at = probe_runtime.next_probe_at?;
     if !config.policy.upgrade_probe_enabled
@@ -655,7 +1671,10 @@ fn next_recv_timeout_ms(
     {
         return None;
     }
-    let dwell = Duration::from_secs(u64::from(config.policy.upgrade_probe_min_dwell_secs));
+    let dwell = Duration::from_secs(u64::from(effective_min_dwell_secs(
+        &config.policy,
+        mobility_mode,
+    )));
     let earliest_probe_at = probe_runtime.connected_at + dwell;
     let effective_probe_at = next_probe_at.max(earliest_probe_at);
     if effective_probe_at <= now {
@@ -674,14 +1693,30 @@ fn upgrade_probe_interval(
     app: &dyn ClientApp,
     power_runtime: &ClientPowerRuntime,
     now: Instant,
+    mobility_mode: bool,
 ) -> Duration {
     let app_state = app
         .power_hint()
         .map(|value| value.app_state)
         .unwrap_or_else(|| power_runtime.current_auto_state(&config.policy.power, now));
-    let secs = match app_state {
-        ClientAppStateHint::Foreground => config.policy.upgrade_probe_foreground_interval_secs,
-        ClientAppStateHint::Background => config.policy.upgrade_probe_background_interval_secs,
+    let secs = if mobility_mode {
+        match app_state {
+            ClientAppStateHint::Foreground => {
+                config
+                    .policy
+                    .mobility_upgrade_probe_foreground_interval_secs
+            }
+            ClientAppStateHint::Background => {
+                config
+                    .policy
+                    .mobility_upgrade_probe_background_interval_secs
+            }
+        }
+    } else {
+        match app_state {
+            ClientAppStateHint::Foreground => config.policy.upgrade_probe_foreground_interval_secs,
+            ClientAppStateHint::Background => config.policy.upgrade_probe_background_interval_secs,
+        }
     };
     Duration::from_secs(u64::from(secs.max(1)))
 }
@@ -690,22 +1725,48 @@ fn has_higher_priority_transport(transport: TransportKind) -> bool {
     !matches!(transport, TransportKind::Quic)
 }
 
+fn transport_priority(transport: TransportKind) -> u8 {
+    match transport {
+        TransportKind::Quic => 0,
+        TransportKind::Tcp => 1,
+        TransportKind::Wss => 2,
+    }
+}
+
 async fn probe_higher_priority_transport(
     config: &ClientConfig,
     current: TransportKind,
+    policy: &PolicyInput,
 ) -> Option<(TransportKind, ClientIo)> {
     let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
+    let pinned = pinned_transport_active(policy);
+    let mut candidates: Vec<TransportKind> = if let Some(pinned_transport) = pinned {
+        if pinned_transport == current || transport_disabled_by_policy(policy, pinned_transport) {
+            Vec::new()
+        } else {
+            vec![pinned_transport]
+        }
+    } else {
+        let current_priority = transport_priority(current);
+        default_transport_order()
+            .into_iter()
+            .filter(|candidate| transport_priority(*candidate) < current_priority)
+            .filter(|candidate| !transport_disabled_by_policy(policy, *candidate))
+            .collect()
+    };
 
-    #[cfg(feature = "quic")]
-    if matches!(current, TransportKind::Wss | TransportKind::Tcp) {
-        let quic_cfg = config.clone();
-        attempts.spawn(async move { (TransportKind::Quic, connect_quic(&quic_cfg).await) });
-    }
-
-    #[cfg(feature = "tcp")]
-    if current == TransportKind::Wss {
-        let tcp_cfg = config.clone();
-        attempts.spawn(async move { (TransportKind::Tcp, connect_tcp(&tcp_cfg).await) });
+    for (index, transport) in candidates.drain(..).enumerate() {
+        let candidate_config = config.clone();
+        let delay_ms = transport_start_delay_ms(config, transport, index);
+        attempts.spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            (
+                transport,
+                connect_transport(&candidate_config, transport).await,
+            )
+        });
     }
 
     if attempts.is_empty() {
@@ -735,6 +1796,67 @@ async fn probe_higher_priority_transport(
         }
     }
 
+    attempts.abort_all();
+    None
+}
+
+async fn probe_alternate_transport(
+    config: &ClientConfig,
+    current: TransportKind,
+    policy: &PolicyInput,
+) -> Option<(TransportKind, ClientIo)> {
+    let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
+    let pinned = pinned_transport_active(policy);
+    let mut candidates: Vec<TransportKind> = default_transport_order()
+        .into_iter()
+        .filter(|candidate| *candidate != current)
+        .filter(|candidate| !transport_disabled_by_policy(policy, *candidate))
+        .collect();
+    if let Some(pinned_transport) = pinned
+        && pinned_transport != current
+        && !transport_disabled_by_policy(policy, pinned_transport)
+    {
+        candidates.retain(|candidate| *candidate != pinned_transport);
+        candidates.insert(0, pinned_transport);
+    }
+    for (index, transport) in candidates.drain(..).enumerate() {
+        let candidate_config = config.clone();
+        let delay_ms = transport_start_delay_ms(config, transport, index);
+        attempts.spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            (
+                transport,
+                connect_transport(&candidate_config, transport).await,
+            )
+        });
+    }
+    if attempts.is_empty() {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_millis(config.policy.upgrade_probe_timeout_ms);
+    while !attempts.is_empty() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remain = deadline.saturating_duration_since(now);
+        let join = match timeout(remain, attempts.join_next()).await {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(result) = join else {
+            break;
+        };
+        let Ok((transport, io_result)) = result else {
+            continue;
+        };
+        if let Ok(io) = io_result {
+            attempts.abort_all();
+            return Some((transport, io));
+        }
+    }
     attempts.abort_all();
     None
 }
@@ -782,30 +1904,50 @@ fn io_transport_kind(io: &ClientIo) -> TransportKind {
     }
 }
 
-async fn hedged_connect(config: &ClientConfig) -> Result<(TransportKind, ClientIo), WarpLinkError> {
+async fn connect_transport(
+    config: &ClientConfig,
+    transport: TransportKind,
+) -> Result<ClientIo, WarpLinkError> {
+    match transport {
+        #[cfg(feature = "quic")]
+        TransportKind::Quic => connect_quic(config).await,
+        #[cfg(not(feature = "quic"))]
+        TransportKind::Quic => Err(WarpLinkError::Unsupported(
+            "quic transport disabled".to_string(),
+        )),
+
+        #[cfg(feature = "tcp")]
+        TransportKind::Tcp => connect_tcp(config).await,
+        #[cfg(not(feature = "tcp"))]
+        TransportKind::Tcp => Err(WarpLinkError::Unsupported(
+            "tcp transport disabled".to_string(),
+        )),
+
+        #[cfg(feature = "wss")]
+        TransportKind::Wss => connect_wss(config).await,
+        #[cfg(not(feature = "wss"))]
+        TransportKind::Wss => Err(WarpLinkError::Unsupported(
+            "wss transport disabled".to_string(),
+        )),
+    }
+}
+
+async fn hedged_connect(
+    config: &ClientConfig,
+    plan: &TransportPlan,
+) -> Result<(TransportKind, ClientIo), WarpLinkError> {
     let mut attempts = JoinSet::new();
 
-    #[cfg(feature = "quic")]
-    {
-        let quic_cfg = config.clone();
-        attempts.spawn(async move { (TransportKind::Quic, connect_quic(&quic_cfg).await) });
-    }
-
-    #[cfg(feature = "wss")]
-    {
-        let wss_cfg = config.clone();
+    for (transport, delay_ms) in plan.attempts.iter().copied() {
+        let candidate_config = config.clone();
         attempts.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(wss_cfg.policy.wss_delay_ms)).await;
-            (TransportKind::Wss, connect_wss(&wss_cfg).await)
-        });
-    }
-
-    #[cfg(feature = "tcp")]
-    {
-        let tcp_cfg = config.clone();
-        attempts.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(tcp_cfg.policy.tcp_delay_ms)).await;
-            (TransportKind::Tcp, connect_tcp(&tcp_cfg).await)
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            (
+                transport,
+                connect_transport(&candidate_config, transport).await,
+            )
         });
     }
 
@@ -2314,4 +3456,286 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, WarpLinkError>
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, WarpLinkError> {
     PrivateKeyDer::from_pem_file(path)
         .map_err(|e| WarpLinkError::Internal(format!("read private key failed: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ClientContinuityState, MobilityTracker, build_transport_plan, default_transport_order,
+        effective_min_dwell_secs, health_gate_passes, migration_blocked_by_cooldown,
+        pinned_transport_active, required_upgrade_windows,
+    };
+    use std::collections::VecDeque;
+    use tokio::time::{Duration, Instant};
+    use warp_link_core::{
+        ClientConfig, DecisionWinnerLayer, PinnedTransport, PolicyInput, TransportKind, WireProfile,
+    };
+
+    #[derive(Default)]
+    struct NoopProfile;
+
+    impl WireProfile for NoopProfile {
+        fn encode_client_hello(
+            &self,
+            _hello: &warp_link_core::HelloCtx,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        fn decode_server_frame(
+            &self,
+            _frame: &[u8],
+        ) -> Result<warp_link_core::DecodedServerFrame, warp_link_core::WireError> {
+            Ok(warp_link_core::DecodedServerFrame::Unknown)
+        }
+
+        fn encode_client_ack(
+            &self,
+            _ack: &warp_link_core::AckMsg,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        fn encode_client_ping(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+
+        fn encode_client_pong(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+
+        fn decode_client_frame(
+            &self,
+            _frame: &[u8],
+        ) -> Result<warp_link_core::DecodedClientFrame, warp_link_core::WireError> {
+            Ok(warp_link_core::DecodedClientFrame::Unknown)
+        }
+
+        fn encode_server_welcome(
+            &self,
+            _welcome: &warp_link_core::WelcomeMsg,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        fn encode_server_deliver(
+            &self,
+            _msg: &warp_link_core::DeliverMsg,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        fn encode_server_ping(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+
+        fn encode_server_pong(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+
+        fn encode_server_goaway(
+            &self,
+            _reason: &str,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+
+        fn encode_server_error(
+            &self,
+            _code: &str,
+            _message: &str,
+        ) -> Result<bytes::Bytes, warp_link_core::WireError> {
+            Ok(bytes::Bytes::new())
+        }
+    }
+
+    fn sample_client_config() -> ClientConfig {
+        ClientConfig {
+            host: "localhost".to_string(),
+            quic_port: 443,
+            wss_port: 443,
+            tcp_port: 5223,
+            wss_path: "/private/ws".to_string(),
+            quic_alpn: "pushgo-quic".to_string(),
+            tcp_alpn: "pushgo-tcp".to_string(),
+            wss_subprotocol: Some("pushgo-private.v1".to_string()),
+            tls_server_name: Some("localhost".to_string()),
+            bearer_token: None,
+            cert_pin_sha256: None,
+            quic_cert_pin_sha256: None,
+            tcp_cert_pin_sha256: None,
+            wss_cert_pin_sha256: None,
+            policy: warp_link_core::ClientPolicy::default(),
+            wire_profile: std::sync::Arc::new(NoopProfile),
+        }
+    }
+
+    #[test]
+    fn continuity_state_tracks_resume_token_and_ack_seq() {
+        let mut state = ClientContinuityState::default();
+        assert!(!state.can_switch_without_loss());
+
+        state.note_welcome(Some("resume-1"));
+        assert!(state.can_switch_without_loss());
+
+        state.note_acked_seq(Some(3));
+        state.note_acked_seq(Some(10));
+        state.note_acked_seq(Some(7));
+        assert_eq!(state.last_acked_seq, Some(10));
+    }
+
+    #[test]
+    fn continuity_state_ignores_empty_resume_token() {
+        let mut state = ClientContinuityState::default();
+        state.note_welcome(Some(" "));
+        assert!(!state.can_switch_without_loss());
+    }
+
+    #[test]
+    fn pinned_transport_ignores_expired_pin() {
+        let policy = PolicyInput {
+            pinned_transport: Some(PinnedTransport {
+                transport: TransportKind::Quic,
+                expires_at_unix_ms: Some(1),
+            }),
+            ..PolicyInput::default()
+        };
+        assert!(pinned_transport_active(&policy).is_none());
+    }
+
+    #[test]
+    fn build_transport_plan_respects_pin_transport() {
+        let config = sample_client_config();
+        let available = default_transport_order();
+        if available.is_empty() {
+            return;
+        }
+        let pinned = available[0];
+        let policy = PolicyInput {
+            pinned_transport: Some(PinnedTransport {
+                transport: pinned,
+                expires_at_unix_ms: None,
+            }),
+            ..PolicyInput::default()
+        };
+        let plan = build_transport_plan(&config, &policy);
+        assert_eq!(plan.attempts.len(), 1);
+        assert_eq!(plan.attempts[0].0, pinned);
+        assert_eq!(plan.winner_layer, DecisionWinnerLayer::UserCommand);
+    }
+
+    #[test]
+    fn build_transport_plan_blocks_all_when_disabled() {
+        let config = sample_client_config();
+        let disabled = default_transport_order();
+        if disabled.is_empty() {
+            return;
+        }
+        let policy = PolicyInput {
+            disabled_transports: disabled.clone(),
+            ..PolicyInput::default()
+        };
+        let plan = build_transport_plan(&config, &policy);
+        assert!(plan.attempts.is_empty());
+        assert_eq!(plan.suppressed_candidates, disabled);
+    }
+
+    #[test]
+    fn health_gate_rejects_threshold_breach() {
+        let policy = warp_link_core::ClientPolicy::default();
+        let snapshot_ok = warp_link_core::TransportHealthSnapshot {
+            timeout_rate: Some(policy.health_timeout_rate_threshold),
+            ack_non_ok_ratio: Some(policy.health_ack_non_ok_ratio_threshold),
+            dead_air_secs: Some(u64::from(policy.health_dead_air_secs)),
+            rtt_ewma_ms: Some(100),
+            rtt_jitter_ms: Some(10),
+        };
+        assert!(health_gate_passes(&policy, &snapshot_ok));
+
+        let snapshot_bad_timeout = warp_link_core::TransportHealthSnapshot {
+            timeout_rate: Some(policy.health_timeout_rate_threshold + 0.01),
+            ..snapshot_ok.clone()
+        };
+        assert!(!health_gate_passes(&policy, &snapshot_bad_timeout));
+
+        let snapshot_bad_ack = warp_link_core::TransportHealthSnapshot {
+            ack_non_ok_ratio: Some(policy.health_ack_non_ok_ratio_threshold + 0.01),
+            ..snapshot_ok.clone()
+        };
+        assert!(!health_gate_passes(&policy, &snapshot_bad_ack));
+
+        let snapshot_bad_dead_air = warp_link_core::TransportHealthSnapshot {
+            dead_air_secs: Some(u64::from(policy.health_dead_air_secs) + 1),
+            ..snapshot_ok
+        };
+        assert!(!health_gate_passes(&policy, &snapshot_bad_dead_air));
+    }
+
+    #[test]
+    fn migration_cooldown_blocks_when_limit_hit_and_recovers_after_window() {
+        let mut policy = warp_link_core::ClientPolicy::default();
+        policy.scheduler_max_migrations_per_5m = 2;
+        policy.scheduler_cooldown_secs = 90;
+        let now = Instant::now();
+        let mut history = VecDeque::from(vec![
+            now - Duration::from_secs(10),
+            now - Duration::from_secs(5),
+        ]);
+        let mut cooldown_until: Option<Instant> = None;
+
+        assert!(migration_blocked_by_cooldown(
+            &mut history,
+            &mut cooldown_until,
+            now,
+            &policy
+        ));
+        let cooldown_mark = cooldown_until.expect("cooldown should be set");
+        assert!(cooldown_mark > now);
+
+        assert!(migration_blocked_by_cooldown(
+            &mut history,
+            &mut cooldown_until,
+            now + Duration::from_secs(30),
+            &policy
+        ));
+
+        let much_later = now + Duration::from_secs(420);
+        history.push_back(now - Duration::from_secs(380));
+        history.push_back(now - Duration::from_secs(370));
+        cooldown_until = None;
+        assert!(!migration_blocked_by_cooldown(
+            &mut history,
+            &mut cooldown_until,
+            much_later,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn mobility_tracker_enters_and_exits_mode_with_signal_decay() {
+        let start = Instant::now();
+        let mut tracker = MobilityTracker::new(start, true);
+        assert!(!tracker.in_mode(start));
+
+        tracker.note_timeout(start + Duration::from_secs(1));
+        tracker.note_disconnect(start + Duration::from_secs(2));
+        tracker.note_timeout(start + Duration::from_secs(3));
+        assert!(tracker.in_mode(start + Duration::from_secs(4)));
+
+        assert!(!tracker.in_mode(start + Duration::from_secs(130)));
+    }
+
+    #[test]
+    fn mobility_mode_uses_stricter_upgrade_windows_and_dwell() {
+        let mut policy = warp_link_core::ClientPolicy::default();
+        policy.scheduler_upgrade_confirm_windows = 3;
+        policy.mobility_upgrade_confirm_windows = 5;
+        policy.upgrade_probe_min_dwell_secs = 25;
+        policy.mobility_min_dwell_secs = 60;
+
+        assert_eq!(required_upgrade_windows(&policy, false), 3);
+        assert_eq!(required_upgrade_windows(&policy, true), 5);
+        assert_eq!(effective_min_dwell_secs(&policy, false), 25);
+        assert_eq!(effective_min_dwell_secs(&policy, true), 60);
+    }
 }

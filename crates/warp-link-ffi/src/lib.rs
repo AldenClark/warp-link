@@ -92,6 +92,12 @@ struct PolicyConfig {
     upgrade_probe_background_interval_secs: Option<u16>,
     #[serde(default)]
     upgrade_probe_min_dwell_secs: Option<u16>,
+    #[serde(default)]
+    scheduler_v2_enabled: Option<bool>,
+    #[serde(default)]
+    drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    cutover_guard_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -383,6 +389,15 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
         }
         if let Some(value) = custom.upgrade_probe_min_dwell_secs {
             policy.upgrade_probe_min_dwell_secs = value;
+        }
+        if let Some(value) = custom.scheduler_v2_enabled {
+            policy.scheduler_v2_enabled = value;
+        }
+        if let Some(value) = custom.drain_timeout_ms {
+            policy.drain_timeout_ms = value;
+        }
+        if let Some(value) = custom.cutover_guard_ms {
+            policy.cutover_guard_ms = value;
         }
     }
 
@@ -855,6 +870,87 @@ fn event_to_json(event: &ClientEvent) -> String {
             },
         })
         .to_string(),
+        ClientEvent::SchedulerStateChanged { state, reason_code } => serde_json::json!({
+            "type": "scheduler_state_changed",
+            "state": format!("{state:?}").to_ascii_lowercase(),
+            "reason_code": reason_code,
+        })
+        .to_string(),
+        ClientEvent::CandidateStarted {
+            from,
+            to,
+            decision_id,
+        } => serde_json::json!({
+            "type": "candidate_started",
+            "from": from.to_string(),
+            "to": to.to_string(),
+            "decision_id": decision_id,
+        })
+        .to_string(),
+        ClientEvent::CandidateReady {
+            from,
+            to,
+            decision_id,
+        } => serde_json::json!({
+            "type": "candidate_ready",
+            "from": from.to_string(),
+            "to": to.to_string(),
+            "decision_id": decision_id,
+        })
+        .to_string(),
+        ClientEvent::CutoverCommitted {
+            from,
+            to,
+            decision_id,
+        } => serde_json::json!({
+            "type": "cutover_committed",
+            "from": from.to_string(),
+            "to": to.to_string(),
+            "decision_id": decision_id,
+        })
+        .to_string(),
+        ClientEvent::CutoverRollback {
+            restored,
+            failed,
+            decision_id,
+            reason,
+        } => serde_json::json!({
+            "type": "cutover_rollback",
+            "restored": restored.to_string(),
+            "failed": failed.to_string(),
+            "decision_id": decision_id,
+            "reason": reason,
+        })
+        .to_string(),
+        ClientEvent::DeadConnectionDetected {
+            transport,
+            reason_code,
+        } => serde_json::json!({
+            "type": "dead_connection_detected",
+            "transport": transport.to_string(),
+            "reason_code": reason_code,
+        })
+        .to_string(),
+        ClientEvent::RecoveryTierEntered { tier, reason_code } => serde_json::json!({
+            "type": "recovery_tier_entered",
+            "tier": tier,
+            "reason_code": reason_code,
+        })
+        .to_string(),
+        ClientEvent::DecisionTrace { trace } => serde_json::json!({
+            "type": "decision_trace",
+            "decision_id": trace.decision_id,
+            "winner_layer": format!("{:?}", trace.winner_layer).to_ascii_lowercase(),
+            "reason_code": trace.reason_code,
+            "selected_transport": trace.selected_transport.map(|value| value.to_string()),
+            "inputs_digest": trace.inputs_digest,
+            "suppressed_candidates": trace
+                .suppressed_candidates
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
         ClientEvent::Message { .. } => serde_json::json!({
             "type": "internal_error",
             "error": "message events are serialized in QueueApp::on_event",
@@ -882,5 +978,73 @@ fn decode_payload_map(bytes: &[u8]) -> (serde_json::Value, bool) {
             }
         }
         Err(_) => (serde_json::json!({}), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn parse_app_state_accepts_known_values() {
+        assert_eq!(
+            parse_app_state(Some("foreground")),
+            Some(ClientAppStateHint::Foreground)
+        );
+        assert_eq!(
+            parse_app_state(Some(" Background ")),
+            Some(ClientAppStateHint::Background)
+        );
+        assert_eq!(parse_app_state(Some("unknown")), None);
+        assert_eq!(parse_app_state(None), None);
+    }
+
+    #[test]
+    fn parse_power_tier_accepts_known_values() {
+        assert_eq!(parse_power_tier(Some("high")), Some(ClientPowerTier::High));
+        assert_eq!(
+            parse_power_tier(Some("balanced")),
+            Some(ClientPowerTier::Balanced)
+        );
+        assert_eq!(parse_power_tier(Some("low")), Some(ClientPowerTier::Low));
+        assert_eq!(parse_power_tier(Some("x")), None);
+    }
+
+    #[test]
+    fn parse_power_hint_requires_valid_state() {
+        let hint = parse_power_hint(Some("foreground"), Some("balanced"))
+            .expect("valid state should produce hint");
+        assert_eq!(hint.app_state, ClientAppStateHint::Foreground);
+        assert_eq!(hint.preferred_tier, Some(ClientPowerTier::Balanced));
+        assert!(parse_power_hint(Some("invalid"), Some("high")).is_none());
+    }
+
+    #[test]
+    fn decode_payload_map_handles_success_and_errors() {
+        let mut data = HashMap::new();
+        data.insert("channel_id".to_string(), "ch-1".to_string());
+        let encoded = postcard::to_allocvec(&PrivatePayloadEnvelope {
+            payload_version: PRIVATE_PAYLOAD_VERSION_V1,
+            data,
+        })
+        .expect("envelope should encode");
+        let (decoded, ok) = decode_payload_map(&encoded);
+        assert!(ok);
+        assert_eq!(decoded["channel_id"], "ch-1");
+
+        let unsupported = postcard::to_allocvec(&PrivatePayloadEnvelope {
+            payload_version: 9,
+            data: HashMap::new(),
+        })
+        .expect("unsupported envelope should encode");
+        let (decoded_unsupported, ok_unsupported) = decode_payload_map(&unsupported);
+        assert!(!ok_unsupported);
+        assert_eq!(decoded_unsupported["_decode"], "unsupported_version");
+
+        let (decoded_invalid, ok_invalid) = decode_payload_map(b"not-postcard");
+        assert!(!ok_invalid);
+        assert_eq!(decoded_invalid, serde_json::json!({}));
     }
 }
