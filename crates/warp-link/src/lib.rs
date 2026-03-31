@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "wss"))]
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -116,15 +117,25 @@ fn epoch_millis_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn pinned_transport_active(policy: &PolicyInput) -> Option<TransportKind> {
-    let pinned = policy.pinned_transport.as_ref()?;
+fn transport_preference_active(
+    preference: Option<&warp_link_core::TransportPreference>,
+) -> Option<TransportKind> {
+    let preference = preference?;
     let now_ms = epoch_millis_now();
-    if let Some(expires_at_unix_ms) = pinned.expires_at_unix_ms
+    if let Some(expires_at_unix_ms) = preference.expires_at_unix_ms
         && now_ms >= expires_at_unix_ms
     {
         return None;
     }
-    Some(pinned.transport)
+    Some(preference.transport)
+}
+
+fn required_transport_active(policy: &PolicyInput) -> Option<TransportKind> {
+    transport_preference_active(policy.required_transport.as_ref())
+}
+
+fn preferred_transport_active(policy: &PolicyInput) -> Option<TransportKind> {
+    transport_preference_active(policy.preferred_transport.as_ref())
 }
 
 fn transport_disabled_by_policy(policy: &PolicyInput, transport: TransportKind) -> bool {
@@ -166,38 +177,102 @@ fn transport_start_delay_ms(
     }
 }
 
+fn preferred_fallback_floor_ms(config: &ClientConfig) -> u64 {
+    let mut non_zero = [config.policy.tcp_delay_ms, config.policy.wss_delay_ms]
+        .into_iter()
+        .filter(|value| *value > 0)
+        .collect::<Vec<_>>();
+    non_zero.sort_unstable();
+    let base = non_zero.into_iter().next().unwrap_or(250);
+    let budget_cap = config.policy.connect_budget_ms.saturating_sub(1).max(150);
+    base.clamp(150, budget_cap)
+}
+
+fn preferred_transport_delay_ms(
+    config: &ClientConfig,
+    transport: TransportKind,
+    fallback_index: usize,
+) -> u64 {
+    let base = transport_start_delay_ms(config, transport, fallback_index + 1);
+    let floor = preferred_fallback_floor_ms(config);
+    let stagger = floor.saturating_mul((fallback_index as u64).saturating_add(1));
+    base.max(stagger)
+}
+
+fn reorder_with_preference(
+    mut candidates: Vec<TransportKind>,
+    preferred: Option<TransportKind>,
+) -> Vec<TransportKind> {
+    let Some(preferred) = preferred else {
+        return candidates;
+    };
+    if let Some(index) = candidates
+        .iter()
+        .position(|candidate| *candidate == preferred)
+    {
+        let selected = candidates.remove(index);
+        candidates.insert(0, selected);
+    }
+    candidates
+}
+
+fn policy_inputs_digest(policy: &PolicyInput) -> String {
+    let required = required_transport_active(policy)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let preferred = preferred_transport_active(policy)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        "reconnect_epoch={} control_epoch={} required={} preferred={} disabled_count={}",
+        policy.reconnect_epoch,
+        policy.control_epoch,
+        required,
+        preferred,
+        policy.disabled_transports.len()
+    )
+}
+
 fn build_transport_plan(config: &ClientConfig, policy: &PolicyInput) -> TransportPlan {
     let base_order = default_transport_order();
-    let pinned = pinned_transport_active(policy);
     let mut suppressed = Vec::new();
 
-    if let Some(pinned_transport) = pinned {
-        if transport_disabled_by_policy(policy, pinned_transport) {
+    if let Some(required_transport) = required_transport_active(policy) {
+        if transport_disabled_by_policy(policy, required_transport) {
             return TransportPlan {
                 attempts: Vec::new(),
-                suppressed_candidates: vec![pinned_transport],
+                suppressed_candidates: vec![required_transport],
                 winner_layer: DecisionWinnerLayer::AppPolicy,
-                reason_code: "pinned_transport_disabled",
+                reason_code: "required_transport_disabled",
             };
         }
         return TransportPlan {
-            attempts: vec![(pinned_transport, 0)],
+            attempts: vec![(required_transport, 0)],
             suppressed_candidates: base_order
                 .into_iter()
-                .filter(|candidate| *candidate != pinned_transport)
+                .filter(|candidate| *candidate != required_transport)
                 .collect(),
             winner_layer: DecisionWinnerLayer::UserCommand,
-            reason_code: "user_pin_transport",
+            reason_code: "required_transport",
         };
     }
 
+    let preferred = preferred_transport_active(policy);
     let mut allowed = Vec::new();
-    for transport in base_order {
+    let ordered = reorder_with_preference(base_order.clone(), preferred);
+    let preferred_is_primary = preferred
+        .and_then(|value| base_order.first().copied().map(|primary| value == primary))
+        .unwrap_or(false);
+    for transport in ordered {
         if transport_disabled_by_policy(policy, transport) {
             suppressed.push(transport);
             continue;
         }
-        let delay_ms = transport_start_delay_ms(config, transport, allowed.len());
+        let delay_ms = if preferred.is_some() && !preferred_is_primary && allowed.len() > 0 {
+            preferred_transport_delay_ms(config, transport, allowed.len() - 1)
+        } else {
+            transport_start_delay_ms(config, transport, allowed.len())
+        };
         allowed.push((transport, delay_ms));
     }
 
@@ -211,11 +286,17 @@ fn build_transport_plan(config: &ClientConfig, policy: &PolicyInput) -> Transpor
     }
 
     let winner_layer = if suppressed.is_empty() {
-        DecisionWinnerLayer::AdaptiveScheduler
+        if preferred.is_some() {
+            DecisionWinnerLayer::AppPolicy
+        } else {
+            DecisionWinnerLayer::AdaptiveScheduler
+        }
     } else {
         DecisionWinnerLayer::AppPolicy
     };
-    let reason_code = if suppressed.is_empty() {
+    let reason_code = if preferred.is_some() {
+        "preferred_transport"
+    } else if suppressed.is_empty() {
         "adaptive_transport_plan"
     } else {
         "policy_disabled_transports"
@@ -254,6 +335,85 @@ fn emit_decision_trace(
         suppressed_candidates,
     };
     let _ = app.on_event(ClientEvent::DecisionTrace { trace });
+}
+
+fn scheduler_policy_snapshot(config: &ClientConfig, app: &dyn ClientApp) -> PolicyInput {
+    if config.policy.scheduler_v2_enabled {
+        app.scheduler_policy()
+    } else {
+        PolicyInput::default()
+    }
+}
+
+enum SessionControlAction {
+    Continue,
+    Rebuild {
+        winner_layer: DecisionWinnerLayer,
+        reason_code: &'static str,
+    },
+    Cutover {
+        target: TransportKind,
+        winner_layer: DecisionWinnerLayer,
+        reason_code: &'static str,
+    },
+}
+
+fn evaluate_session_control_action(
+    previous_policy: &PolicyInput,
+    current_policy: &PolicyInput,
+    current_transport: TransportKind,
+    continuity: &ClientContinuityState,
+) -> SessionControlAction {
+    if current_policy.reconnect_epoch != previous_policy.reconnect_epoch {
+        return SessionControlAction::Rebuild {
+            winner_layer: DecisionWinnerLayer::UserCommand,
+            reason_code: "force_reconnect",
+        };
+    }
+    if transport_disabled_by_policy(current_policy, current_transport) {
+        return SessionControlAction::Rebuild {
+            winner_layer: DecisionWinnerLayer::AppPolicy,
+            reason_code: "current_transport_disabled_by_policy",
+        };
+    }
+    let required_transport = required_transport_active(current_policy);
+    if required_transport != required_transport_active(previous_policy)
+        && let Some(required_transport) = required_transport
+        && required_transport != current_transport
+    {
+        if continuity.can_switch_without_loss() {
+            return SessionControlAction::Cutover {
+                target: required_transport,
+                winner_layer: DecisionWinnerLayer::UserCommand,
+                reason_code: "required_transport_requires_cutover",
+            };
+        }
+        return SessionControlAction::Rebuild {
+            winner_layer: DecisionWinnerLayer::UserCommand,
+            reason_code: "required_transport_requires_reconnect",
+        };
+    }
+    SessionControlAction::Continue
+}
+
+enum WaitWithControl<T> {
+    Value(T),
+    ControlChanged,
+}
+
+async fn await_value_or_control_change<T>(
+    config: &ClientConfig,
+    app: &dyn ClientApp,
+    observed_control_epoch: u64,
+    value: impl Future<Output = T> + Send,
+) -> WaitWithControl<T> {
+    if !config.policy.scheduler_v2_enabled {
+        return WaitWithControl::Value(value.await);
+    }
+    tokio::select! {
+        output = value => WaitWithControl::Value(output),
+        _ = app.wait_for_control_change(observed_control_epoch) => WaitWithControl::ControlChanged,
+    }
 }
 
 struct HealthTracker {
@@ -566,6 +726,10 @@ pub async fn client_run_with_shutdown(
                             return Ok(());
                         }
                     }
+                    _ = app.wait_for_control_change(scheduler_policy_snapshot(&config, app.as_ref()).control_epoch), if config.policy.scheduler_v2_enabled => {
+                        attempt = 0;
+                        continue;
+                    }
                 }
             }
         }
@@ -585,11 +749,7 @@ async fn run_client_session_once(
             "session_start",
         );
     }
-    let initial_policy = if config.policy.scheduler_v2_enabled {
-        app.scheduler_policy()
-    } else {
-        PolicyInput::default()
-    };
+    let initial_policy = scheduler_policy_snapshot(config, app.as_ref());
     let connect_plan = build_transport_plan(config, &initial_policy);
     if connect_plan.attempts.is_empty() {
         if config.policy.scheduler_v2_enabled {
@@ -605,14 +765,7 @@ async fn run_client_session_once(
                 connect_plan.reason_code,
                 None,
                 connect_plan.suppressed_candidates.clone(),
-                format!(
-                    "force_reconnect_nonce={} pinned={} disabled_count={}",
-                    initial_policy.force_reconnect_nonce,
-                    pinned_transport_active(&initial_policy)
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    initial_policy.disabled_transports.len()
-                ),
+                policy_inputs_digest(&initial_policy),
             );
         }
         return Err(WarpLinkError::Unsupported(
@@ -627,14 +780,7 @@ async fn run_client_session_once(
         connect_plan.reason_code,
         Some(transport),
         connect_plan.suppressed_candidates.clone(),
-        format!(
-            "force_reconnect_nonce={} pinned={} disabled_count={}",
-            initial_policy.force_reconnect_nonce,
-            pinned_transport_active(&initial_policy)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            initial_policy.disabled_transports.len()
-        ),
+        policy_inputs_digest(&initial_policy),
     );
     decision_id_seq = decision_id_seq.saturating_add(1);
     let _ = app.on_event(ClientEvent::Connected { transport });
@@ -653,20 +799,70 @@ async fn run_client_session_once(
     io.send_frame(&hello_frame, config.policy.write_timeout_ms)
         .await?;
     let mut inband_hello_snapshot = hello;
-
-    let first = io.recv_frame(config.policy.connect_timeout_ms).await?;
-    let welcome = match config.wire_profile.decode_server_frame(&first)? {
-        DecodedServerFrame::Welcome(value) => value,
-        DecodedServerFrame::Error { code, message } => {
-            return Err(WarpLinkError::Protocol(format!(
-                "gateway error: {code} {message}"
-            )));
-        }
-        _ => {
-            return Err(WarpLinkError::Protocol(
-                "expected welcome frame from server".to_string(),
-            ));
-        }
+    let mut last_policy = initial_policy.clone();
+    let welcome = loop {
+        let first = match await_value_or_control_change(
+            config,
+            app.as_ref(),
+            last_policy.control_epoch,
+            io.recv_frame(config.policy.connect_timeout_ms),
+        )
+        .await
+        {
+            WaitWithControl::Value(result) => result?,
+            WaitWithControl::ControlChanged => {
+                let policy_input = scheduler_policy_snapshot(config, app.as_ref());
+                match evaluate_session_control_action(
+                    &last_policy,
+                    &policy_input,
+                    transport,
+                    continuity,
+                ) {
+                    SessionControlAction::Continue => {
+                        last_policy = policy_input;
+                        continue;
+                    }
+                    SessionControlAction::Rebuild {
+                        winner_layer,
+                        reason_code,
+                    } => {
+                        emit_decision_trace(
+                            app.as_ref(),
+                            decision_id_seq,
+                            winner_layer,
+                            reason_code,
+                            Some(transport),
+                            vec![transport],
+                            policy_inputs_digest(&policy_input),
+                        );
+                        emit_scheduler_state(app.as_ref(), SchedulerState::Recovering, reason_code);
+                        return Ok(());
+                    }
+                    SessionControlAction::Cutover { .. } => {
+                        emit_scheduler_state(
+                            app.as_ref(),
+                            SchedulerState::Recovering,
+                            "required_transport_requires_reconnect",
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        };
+        let decoded = config.wire_profile.decode_server_frame(&first)?;
+        break match decoded {
+            DecodedServerFrame::Welcome(value) => value,
+            DecodedServerFrame::Error { code, message } => {
+                return Err(WarpLinkError::Protocol(format!(
+                    "gateway error: {code} {message}"
+                )));
+            }
+            _ => {
+                return Err(WarpLinkError::Protocol(
+                    "expected welcome frame from server".to_string(),
+                ));
+            }
+        };
     };
     let _ = app.on_event(ClientEvent::Welcome {
         welcome: welcome.clone(),
@@ -692,7 +888,6 @@ async fn run_client_session_once(
         Instant::now(),
         mobility_mode,
     );
-    let last_force_reconnect_nonce = initial_policy.force_reconnect_nonce;
 
     loop {
         maybe_send_inband_hello_update(
@@ -705,94 +900,86 @@ async fn run_client_session_once(
         )
         .await?;
         if config.policy.scheduler_v2_enabled {
-            let policy_input = app.scheduler_policy();
-            if policy_input.force_reconnect_nonce != last_force_reconnect_nonce {
-                emit_decision_trace(
-                    app.as_ref(),
-                    decision_id_seq,
-                    DecisionWinnerLayer::UserCommand,
-                    "force_reconnect",
-                    Some(transport),
-                    Vec::new(),
-                    format!(
-                        "force_reconnect_nonce={} current_transport={}",
-                        policy_input.force_reconnect_nonce, transport
-                    ),
-                );
-                emit_scheduler_state(
-                    app.as_ref(),
-                    SchedulerState::Recovering,
-                    "force_reconnect_requested",
-                );
-                return Ok(());
-            }
-            if transport_disabled_by_policy(&policy_input, transport) {
-                emit_decision_trace(
-                    app.as_ref(),
-                    decision_id_seq,
-                    DecisionWinnerLayer::AppPolicy,
-                    "current_transport_disabled_by_policy",
-                    Some(transport),
-                    vec![transport],
-                    format!("current_transport={} disabled=1", transport),
-                );
-                emit_scheduler_state(
-                    app.as_ref(),
-                    SchedulerState::Recovering,
-                    "policy_transport_blocked",
-                );
-                return Ok(());
-            }
-            if let Some(pinned_transport) = pinned_transport_active(&policy_input)
-                && pinned_transport != transport
-                && continuity.can_switch_without_loss()
-            {
-                emit_decision_trace(
-                    app.as_ref(),
-                    decision_id_seq,
-                    DecisionWinnerLayer::UserCommand,
-                    "pin_transport_requires_cutover",
-                    Some(pinned_transport),
-                    vec![transport],
-                    format!("from={} to={}", transport, pinned_transport),
-                );
-                if let Some(candidate_io) = connect_transport(config, pinned_transport).await.ok()
-                    && let Some(candidate_welcome) = commit_candidate_cutover(
-                        config,
-                        Arc::clone(&app),
-                        continuity,
-                        &mut power_runtime,
-                        &mut transport,
-                        &mut io,
-                        pinned_transport,
-                        candidate_io,
-                        decision_id_seq,
-                    )
-                    .await?
-                {
-                    continuity.note_welcome(candidate_welcome.resume_token.as_deref());
-                    idle_timeout_ms =
-                        u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
-                    idle_timeout_streak = 0;
-                    last_idle_ping_at = Instant::now();
-                    inband_hello_snapshot =
-                        build_effective_hello(config, app.as_ref(), &mut power_runtime);
-                    continuity.apply_to_hello(&mut inband_hello_snapshot);
-                    upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
-                    let mobility_mode = mobility_tracker.in_mode(Instant::now());
-                    upgrade_probe_runtime.schedule_next(
-                        config,
-                        app.as_ref(),
-                        &power_runtime,
-                        Instant::now(),
-                        mobility_mode,
-                    );
-                    purge_old_migrations(&mut migration_history, Instant::now());
-                    migration_history.push_back(Instant::now());
-                    decision_id_seq = decision_id_seq.saturating_add(1);
-                    continue;
+            let policy_input = scheduler_policy_snapshot(config, app.as_ref());
+            match evaluate_session_control_action(
+                &last_policy,
+                &policy_input,
+                transport,
+                continuity,
+            ) {
+                SessionControlAction::Continue => {
+                    last_policy = policy_input;
                 }
-                decision_id_seq = decision_id_seq.saturating_add(1);
+                SessionControlAction::Rebuild {
+                    winner_layer,
+                    reason_code,
+                } => {
+                    emit_decision_trace(
+                        app.as_ref(),
+                        decision_id_seq,
+                        winner_layer,
+                        reason_code,
+                        Some(transport),
+                        vec![transport],
+                        policy_inputs_digest(&policy_input),
+                    );
+                    emit_scheduler_state(app.as_ref(), SchedulerState::Recovering, reason_code);
+                    return Ok(());
+                }
+                SessionControlAction::Cutover {
+                    target,
+                    winner_layer,
+                    reason_code,
+                } => {
+                    emit_decision_trace(
+                        app.as_ref(),
+                        decision_id_seq,
+                        winner_layer,
+                        reason_code,
+                        Some(target),
+                        vec![transport],
+                        policy_inputs_digest(&policy_input),
+                    );
+                    if let Some(candidate_io) = connect_transport(config, target).await.ok()
+                        && let Some(candidate_welcome) = commit_candidate_cutover(
+                            config,
+                            Arc::clone(&app),
+                            continuity,
+                            &mut power_runtime,
+                            &mut transport,
+                            &mut io,
+                            target,
+                            candidate_io,
+                            decision_id_seq,
+                        )
+                        .await?
+                    {
+                        continuity.note_welcome(candidate_welcome.resume_token.as_deref());
+                        idle_timeout_ms =
+                            u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
+                        idle_timeout_streak = 0;
+                        last_idle_ping_at = Instant::now();
+                        inband_hello_snapshot =
+                            build_effective_hello(config, app.as_ref(), &mut power_runtime);
+                        continuity.apply_to_hello(&mut inband_hello_snapshot);
+                        upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
+                        let mobility_mode = mobility_tracker.in_mode(Instant::now());
+                        upgrade_probe_runtime.schedule_next(
+                            config,
+                            app.as_ref(),
+                            &power_runtime,
+                            Instant::now(),
+                            mobility_mode,
+                        );
+                        purge_old_migrations(&mut migration_history, Instant::now());
+                        migration_history.push_back(Instant::now());
+                        last_policy = policy_input;
+                        decision_id_seq = decision_id_seq.saturating_add(1);
+                        continue;
+                    }
+                    emit_scheduler_state(app.as_ref(), SchedulerState::Recovering, reason_code);
+                    return Ok(());
+                }
             }
         }
         if app.take_probe_request() && pending_ping_sent_at.is_none() {
@@ -808,99 +995,248 @@ async fn run_client_session_once(
                 .unwrap_or(idle_timeout_ms)
                 .min(idle_timeout_ms)
                 .max(1);
-        let frame = match io.recv_frame(recv_timeout_ms).await {
-            Ok(frame) => {
-                idle_timeout_streak = 0;
-                last_idle_ping_at = Instant::now();
-                health_tracker.note_frame_progress(Instant::now());
-                frame
-            }
-            Err(WarpLinkError::Timeout(_)) => {
-                let now = Instant::now();
-                health_tracker.note_timeout();
-                mobility_tracker.note_timeout(now);
-                if upgrade_probe_runtime.should_probe(config, now, mobility_mode) {
-                    if continuity.can_switch_without_loss() {
-                        let policy_input = if config.policy.scheduler_v2_enabled {
-                            app.scheduler_policy()
-                        } else {
-                            PolicyInput::default()
-                        };
-                        let probe_started_at = Instant::now();
-                        let probe_candidate =
-                            probe_higher_priority_transport(config, transport, &policy_input).await;
-                        if let Some((target, candidate_io)) = probe_candidate {
-                            let candidate_connect_elapsed_ms = duration_ms(
-                                Instant::now().saturating_duration_since(probe_started_at),
-                            );
-                            let primary_snapshot = health_tracker.snapshot(now);
-                            let candidate_snapshot = warp_link_core::TransportHealthSnapshot {
-                                timeout_rate: Some(0.0),
-                                ack_non_ok_ratio: Some(0.0),
-                                dead_air_secs: Some(0),
-                                rtt_ewma_ms: Some(candidate_connect_elapsed_ms),
-                                rtt_jitter_ms: Some(0),
-                            };
-                            let gate_ok = health_gate_passes(&config.policy, &primary_snapshot)
-                                && health_gate_passes(&config.policy, &candidate_snapshot);
-                            let primary_score = combined_score(transport, None, &primary_snapshot);
-                            let candidate_score = combined_score(
+        let frame = match await_value_or_control_change(
+            config,
+            app.as_ref(),
+            last_policy.control_epoch,
+            io.recv_frame(recv_timeout_ms),
+        )
+        .await
+        {
+            WaitWithControl::ControlChanged => {
+                let policy_input = scheduler_policy_snapshot(config, app.as_ref());
+                match evaluate_session_control_action(
+                    &last_policy,
+                    &policy_input,
+                    transport,
+                    continuity,
+                ) {
+                    SessionControlAction::Continue => {
+                        last_policy = policy_input;
+                        continue;
+                    }
+                    SessionControlAction::Rebuild {
+                        winner_layer,
+                        reason_code,
+                    } => {
+                        emit_decision_trace(
+                            app.as_ref(),
+                            decision_id_seq,
+                            winner_layer,
+                            reason_code,
+                            Some(transport),
+                            vec![transport],
+                            policy_inputs_digest(&policy_input),
+                        );
+                        emit_scheduler_state(app.as_ref(), SchedulerState::Recovering, reason_code);
+                        return Ok(());
+                    }
+                    SessionControlAction::Cutover {
+                        target,
+                        winner_layer,
+                        reason_code,
+                    } => {
+                        emit_decision_trace(
+                            app.as_ref(),
+                            decision_id_seq,
+                            winner_layer,
+                            reason_code,
+                            Some(target),
+                            vec![transport],
+                            policy_inputs_digest(&policy_input),
+                        );
+                        if let Some(candidate_io) = connect_transport(config, target).await.ok()
+                            && let Some(candidate_welcome) = commit_candidate_cutover(
+                                config,
+                                Arc::clone(&app),
+                                continuity,
+                                &mut power_runtime,
+                                &mut transport,
+                                &mut io,
                                 target,
-                                Some(candidate_connect_elapsed_ms),
-                                &candidate_snapshot,
+                                candidate_io,
+                                decision_id_seq,
+                            )
+                            .await?
+                        {
+                            continuity.note_welcome(candidate_welcome.resume_token.as_deref());
+                            idle_timeout_ms =
+                                u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
+                                    * 1_000;
+                            idle_timeout_streak = 0;
+                            last_idle_ping_at = Instant::now();
+                            inband_hello_snapshot =
+                                build_effective_hello(config, app.as_ref(), &mut power_runtime);
+                            continuity.apply_to_hello(&mut inband_hello_snapshot);
+                            upgrade_probe_runtime =
+                                UpgradeProbeRuntime::new(transport, Instant::now());
+                            let mobility_mode = mobility_tracker.in_mode(Instant::now());
+                            upgrade_probe_runtime.schedule_next(
+                                config,
+                                app.as_ref(),
+                                &power_runtime,
+                                Instant::now(),
+                                mobility_mode,
                             );
-                            let required_margin = 1.0
-                                + (f64::from(config.policy.scheduler_hysteresis_percent) / 100.0);
-                            let beats =
-                                gate_ok && candidate_score >= (primary_score * required_margin);
-                            if beats {
-                                adaptive_upgrade_streak = adaptive_upgrade_streak.saturating_add(1);
+                            purge_old_migrations(&mut migration_history, Instant::now());
+                            migration_history.push_back(Instant::now());
+                            last_policy = policy_input;
+                            decision_id_seq = decision_id_seq.saturating_add(1);
+                            continue;
+                        }
+                        emit_scheduler_state(app.as_ref(), SchedulerState::Recovering, reason_code);
+                        return Ok(());
+                    }
+                }
+            }
+            WaitWithControl::Value(result) => match result {
+                Ok(frame) => {
+                    idle_timeout_streak = 0;
+                    last_idle_ping_at = Instant::now();
+                    health_tracker.note_frame_progress(Instant::now());
+                    frame
+                }
+                Err(WarpLinkError::Timeout(_)) => {
+                    let now = Instant::now();
+                    health_tracker.note_timeout();
+                    mobility_tracker.note_timeout(now);
+                    if upgrade_probe_runtime.should_probe(config, now, mobility_mode) {
+                        if continuity.can_switch_without_loss() {
+                            let policy_input = if config.policy.scheduler_v2_enabled {
+                                app.scheduler_policy()
                             } else {
-                                adaptive_upgrade_streak = 0;
-                            }
-                            let required_windows =
-                                required_upgrade_windows(&config.policy, mobility_mode);
-                            if adaptive_upgrade_streak >= required_windows {
-                                if migration_blocked_by_cooldown(
-                                    &mut migration_history,
-                                    &mut migration_cooldown_until,
-                                    now,
-                                    &config.policy,
-                                ) {
-                                    emit_decision_trace(
-                                        app.as_ref(),
-                                        decision_id_seq,
-                                        DecisionWinnerLayer::AdaptiveScheduler,
-                                        "migration_cooldown_active",
-                                        Some(target),
-                                        Vec::new(),
-                                        format!(
-                                            "score_primary={:.2} score_candidate={:.2} streak={} required={}",
-                                            primary_score,
-                                            candidate_score,
-                                            adaptive_upgrade_streak,
-                                            required_windows
-                                        ),
-                                    );
-                                    adaptive_upgrade_streak = 0;
-                                } else if let Some(candidate_welcome) = commit_candidate_cutover(
-                                    config,
-                                    Arc::clone(&app),
-                                    continuity,
-                                    &mut power_runtime,
-                                    &mut transport,
-                                    &mut io,
+                                PolicyInput::default()
+                            };
+                            let probe_started_at = Instant::now();
+                            let probe_candidate =
+                                probe_higher_priority_transport(config, transport, &policy_input)
+                                    .await;
+                            if let Some((target, candidate_io)) = probe_candidate {
+                                let candidate_connect_elapsed_ms = duration_ms(
+                                    Instant::now().saturating_duration_since(probe_started_at),
+                                );
+                                let primary_snapshot = health_tracker.snapshot(now);
+                                let candidate_snapshot = warp_link_core::TransportHealthSnapshot {
+                                    timeout_rate: Some(0.0),
+                                    ack_non_ok_ratio: Some(0.0),
+                                    dead_air_secs: Some(0),
+                                    rtt_ewma_ms: Some(candidate_connect_elapsed_ms),
+                                    rtt_jitter_ms: Some(0),
+                                };
+                                let gate_ok = health_gate_passes(&config.policy, &primary_snapshot)
+                                    && health_gate_passes(&config.policy, &candidate_snapshot);
+                                let primary_score =
+                                    combined_score(transport, None, &primary_snapshot);
+                                let candidate_score = combined_score(
                                     target,
-                                    candidate_io,
-                                    decision_id_seq,
-                                )
-                                .await?
-                                {
+                                    Some(candidate_connect_elapsed_ms),
+                                    &candidate_snapshot,
+                                );
+                                let required_margin = 1.0
+                                    + (f64::from(config.policy.scheduler_hysteresis_percent)
+                                        / 100.0);
+                                let beats =
+                                    gate_ok && candidate_score >= (primary_score * required_margin);
+                                if beats {
+                                    adaptive_upgrade_streak =
+                                        adaptive_upgrade_streak.saturating_add(1);
+                                } else {
+                                    adaptive_upgrade_streak = 0;
+                                }
+                                let required_windows =
+                                    required_upgrade_windows(&config.policy, mobility_mode);
+                                if adaptive_upgrade_streak >= required_windows {
+                                    if migration_blocked_by_cooldown(
+                                        &mut migration_history,
+                                        &mut migration_cooldown_until,
+                                        now,
+                                        &config.policy,
+                                    ) {
+                                        emit_decision_trace(
+                                            app.as_ref(),
+                                            decision_id_seq,
+                                            DecisionWinnerLayer::AdaptiveScheduler,
+                                            "migration_cooldown_active",
+                                            Some(target),
+                                            Vec::new(),
+                                            format!(
+                                                "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                                primary_score,
+                                                candidate_score,
+                                                adaptive_upgrade_streak,
+                                                required_windows
+                                            ),
+                                        );
+                                        adaptive_upgrade_streak = 0;
+                                    } else if let Some(candidate_welcome) =
+                                        commit_candidate_cutover(
+                                            config,
+                                            Arc::clone(&app),
+                                            continuity,
+                                            &mut power_runtime,
+                                            &mut transport,
+                                            &mut io,
+                                            target,
+                                            candidate_io,
+                                            decision_id_seq,
+                                        )
+                                        .await?
+                                    {
+                                        emit_decision_trace(
+                                            app.as_ref(),
+                                            decision_id_seq,
+                                            DecisionWinnerLayer::AdaptiveScheduler,
+                                            "adaptive_upgrade_probe",
+                                            Some(target),
+                                            Vec::new(),
+                                            format!(
+                                                "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                                primary_score,
+                                                candidate_score,
+                                                adaptive_upgrade_streak,
+                                                required_windows
+                                            ),
+                                        );
+                                        continuity.note_welcome(
+                                            candidate_welcome.resume_token.as_deref(),
+                                        );
+                                        idle_timeout_ms = u64::from(
+                                            candidate_welcome.ping_interval_secs.clamp(5, 30),
+                                        ) * 1_000;
+                                        idle_timeout_streak = 0;
+                                        last_idle_ping_at = Instant::now();
+                                        inband_hello_snapshot = build_effective_hello(
+                                            config,
+                                            app.as_ref(),
+                                            &mut power_runtime,
+                                        );
+                                        continuity.apply_to_hello(&mut inband_hello_snapshot);
+                                        upgrade_probe_runtime =
+                                            UpgradeProbeRuntime::new(transport, Instant::now());
+                                        let mobility_mode =
+                                            mobility_tracker.in_mode(Instant::now());
+                                        upgrade_probe_runtime.schedule_next(
+                                            config,
+                                            app.as_ref(),
+                                            &power_runtime,
+                                            Instant::now(),
+                                            mobility_mode,
+                                        );
+                                        purge_old_migrations(
+                                            &mut migration_history,
+                                            Instant::now(),
+                                        );
+                                        migration_history.push_back(Instant::now());
+                                        adaptive_upgrade_streak = 0;
+                                        decision_id_seq = decision_id_seq.saturating_add(1);
+                                        continue;
+                                    }
+                                } else {
                                     emit_decision_trace(
                                         app.as_ref(),
                                         decision_id_seq,
                                         DecisionWinnerLayer::AdaptiveScheduler,
-                                        "adaptive_upgrade_probe",
+                                        "hysteresis_wait",
                                         Some(target),
                                         Vec::new(),
                                         format!(
@@ -911,6 +1247,74 @@ async fn run_client_session_once(
                                             required_windows
                                         ),
                                     );
+                                }
+                            }
+                            upgrade_probe_runtime.note_probe_failure(
+                                config,
+                                app.as_ref(),
+                                &power_runtime,
+                                now,
+                                mobility_mode,
+                            );
+                        } else {
+                            upgrade_probe_runtime.note_probe_skip(
+                                config,
+                                app.as_ref(),
+                                &power_runtime,
+                                now,
+                                mobility_mode,
+                            );
+                        }
+                    }
+
+                    if now.saturating_duration_since(last_idle_ping_at)
+                        >= Duration::from_millis(idle_timeout_ms)
+                    {
+                        idle_timeout_streak = idle_timeout_streak.saturating_add(1);
+                        let dead_air_secs = health_tracker
+                            .snapshot(now)
+                            .dead_air_secs
+                            .unwrap_or_default();
+                        if idle_timeout_streak >= 3
+                            && dead_air_secs >= u64::from(config.policy.health_dead_air_secs)
+                            && upgrade_probe_runtime.probe_failure_streak
+                                >= config.policy.dead_connection_probe_failure_threshold
+                        {
+                            let _ = app.on_event(ClientEvent::DeadConnectionDetected {
+                                transport,
+                                reason_code: "multi_signal_dead_connection".to_string(),
+                            });
+                            let _ = app.on_event(ClientEvent::RecoveryTierEntered {
+                                tier: 1,
+                                reason_code: "same_transport_rehandshake".to_string(),
+                            });
+                            if continuity.can_switch_without_loss() {
+                                let policy_input = if config.policy.scheduler_v2_enabled {
+                                    app.scheduler_policy()
+                                } else {
+                                    PolicyInput::default()
+                                };
+                                let alternate =
+                                    probe_alternate_transport(config, transport, &policy_input)
+                                        .await;
+                                if let Some((target, candidate_io)) = alternate
+                                    && let Some(candidate_welcome) = commit_candidate_cutover(
+                                        config,
+                                        Arc::clone(&app),
+                                        continuity,
+                                        &mut power_runtime,
+                                        &mut transport,
+                                        &mut io,
+                                        target,
+                                        candidate_io,
+                                        decision_id_seq,
+                                    )
+                                    .await?
+                                {
+                                    let _ = app.on_event(ClientEvent::RecoveryTierEntered {
+                                        tier: 2,
+                                        reason_code: "alternate_transport_recovery".to_string(),
+                                    });
                                     continuity
                                         .note_welcome(candidate_welcome.resume_token.as_deref());
                                     idle_timeout_ms = u64::from(
@@ -934,144 +1338,37 @@ async fn run_client_session_once(
                                         Instant::now(),
                                         mobility_mode,
                                     );
-                                    purge_old_migrations(&mut migration_history, Instant::now());
-                                    migration_history.push_back(Instant::now());
-                                    adaptive_upgrade_streak = 0;
-                                    decision_id_seq = decision_id_seq.saturating_add(1);
                                     continue;
                                 }
-                            } else {
-                                emit_decision_trace(
-                                    app.as_ref(),
-                                    decision_id_seq,
-                                    DecisionWinnerLayer::AdaptiveScheduler,
-                                    "hysteresis_wait",
-                                    Some(target),
-                                    Vec::new(),
-                                    format!(
-                                        "score_primary={:.2} score_candidate={:.2} streak={} required={}",
-                                        primary_score,
-                                        candidate_score,
-                                        adaptive_upgrade_streak,
-                                        required_windows
-                                    ),
-                                );
                             }
+                            return Ok(());
                         }
-                        upgrade_probe_runtime.note_probe_failure(
-                            config,
-                            app.as_ref(),
-                            &power_runtime,
-                            now,
-                            mobility_mode,
-                        );
-                    } else {
-                        upgrade_probe_runtime.note_probe_skip(
-                            config,
-                            app.as_ref(),
-                            &power_runtime,
-                            now,
-                            mobility_mode,
-                        );
-                    }
-                }
-
-                if now.saturating_duration_since(last_idle_ping_at)
-                    >= Duration::from_millis(idle_timeout_ms)
-                {
-                    idle_timeout_streak = idle_timeout_streak.saturating_add(1);
-                    let dead_air_secs = health_tracker
-                        .snapshot(now)
-                        .dead_air_secs
-                        .unwrap_or_default();
-                    if idle_timeout_streak >= 3
-                        && dead_air_secs >= u64::from(config.policy.health_dead_air_secs)
-                        && upgrade_probe_runtime.probe_failure_streak
-                            >= config.policy.dead_connection_probe_failure_threshold
-                    {
-                        let _ = app.on_event(ClientEvent::DeadConnectionDetected {
-                            transport,
-                            reason_code: "multi_signal_dead_connection".to_string(),
-                        });
-                        let _ = app.on_event(ClientEvent::RecoveryTierEntered {
-                            tier: 1,
-                            reason_code: "same_transport_rehandshake".to_string(),
-                        });
-                        if continuity.can_switch_without_loss() {
-                            let policy_input = if config.policy.scheduler_v2_enabled {
-                                app.scheduler_policy()
-                            } else {
-                                PolicyInput::default()
-                            };
-                            let alternate =
-                                probe_alternate_transport(config, transport, &policy_input).await;
-                            if let Some((target, candidate_io)) = alternate
-                                && let Some(candidate_welcome) = commit_candidate_cutover(
-                                    config,
-                                    Arc::clone(&app),
-                                    continuity,
-                                    &mut power_runtime,
-                                    &mut transport,
-                                    &mut io,
-                                    target,
-                                    candidate_io,
-                                    decision_id_seq,
-                                )
-                                .await?
-                            {
-                                let _ = app.on_event(ClientEvent::RecoveryTierEntered {
-                                    tier: 2,
-                                    reason_code: "alternate_transport_recovery".to_string(),
-                                });
-                                continuity.note_welcome(candidate_welcome.resume_token.as_deref());
-                                idle_timeout_ms =
-                                    u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
-                                        * 1_000;
-                                idle_timeout_streak = 0;
-                                last_idle_ping_at = Instant::now();
-                                inband_hello_snapshot =
-                                    build_effective_hello(config, app.as_ref(), &mut power_runtime);
-                                continuity.apply_to_hello(&mut inband_hello_snapshot);
-                                upgrade_probe_runtime =
-                                    UpgradeProbeRuntime::new(transport, Instant::now());
-                                let mobility_mode = mobility_tracker.in_mode(Instant::now());
-                                upgrade_probe_runtime.schedule_next(
-                                    config,
-                                    app.as_ref(),
-                                    &power_runtime,
-                                    Instant::now(),
-                                    mobility_mode,
-                                );
-                                continue;
-                            }
+                        if idle_timeout_streak >= 4 {
+                            let _ = app.on_event(ClientEvent::Disconnected {
+                                transport,
+                                reason: "idle timeout".to_string(),
+                            });
+                            return Err(WarpLinkError::Timeout("idle timeout".to_string()));
                         }
-                        return Ok(());
+                        let ping = config.wire_profile.encode_client_ping();
+                        io.send_frame(&ping, config.policy.write_timeout_ms).await?;
+                        last_idle_ping_at = now;
+                        if pending_ping_sent_at.is_none() {
+                            pending_ping_sent_at = Some(now);
+                            pending_ping_source = Some(ProbeRttSource::IdleKeepalive);
+                        }
                     }
-                    if idle_timeout_streak >= 4 {
-                        let _ = app.on_event(ClientEvent::Disconnected {
-                            transport,
-                            reason: "idle timeout".to_string(),
-                        });
-                        return Err(WarpLinkError::Timeout("idle timeout".to_string()));
-                    }
-                    let ping = config.wire_profile.encode_client_ping();
-                    io.send_frame(&ping, config.policy.write_timeout_ms).await?;
-                    last_idle_ping_at = now;
-                    if pending_ping_sent_at.is_none() {
-                        pending_ping_sent_at = Some(now);
-                        pending_ping_source = Some(ProbeRttSource::IdleKeepalive);
-                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(err) => {
-                mobility_tracker.note_disconnect(Instant::now());
-                let _ = app.on_event(ClientEvent::Disconnected {
-                    transport,
-                    reason: err.to_string(),
-                });
-                return Err(err);
-            }
+                Err(err) => {
+                    mobility_tracker.note_disconnect(Instant::now());
+                    let _ = app.on_event(ClientEvent::Disconnected {
+                        transport,
+                        reason: err.to_string(),
+                    });
+                    return Err(err);
+                }
+            },
         };
 
         let control = handle_primary_frame(
@@ -1739,20 +2036,23 @@ async fn probe_higher_priority_transport(
     policy: &PolicyInput,
 ) -> Option<(TransportKind, ClientIo)> {
     let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
-    let pinned = pinned_transport_active(policy);
-    let mut candidates: Vec<TransportKind> = if let Some(pinned_transport) = pinned {
-        if pinned_transport == current || transport_disabled_by_policy(policy, pinned_transport) {
+    let required = required_transport_active(policy);
+    let preferred = preferred_transport_active(policy);
+    let mut candidates: Vec<TransportKind> = if let Some(required_transport) = required {
+        if required_transport == current || transport_disabled_by_policy(policy, required_transport)
+        {
             Vec::new()
         } else {
-            vec![pinned_transport]
+            vec![required_transport]
         }
     } else {
         let current_priority = transport_priority(current);
-        default_transport_order()
+        let ordered = default_transport_order()
             .into_iter()
             .filter(|candidate| transport_priority(*candidate) < current_priority)
             .filter(|candidate| !transport_disabled_by_policy(policy, *candidate))
-            .collect()
+            .collect();
+        reorder_with_preference(ordered, preferred)
     };
 
     for (index, transport) in candidates.drain(..).enumerate() {
@@ -1806,19 +2106,23 @@ async fn probe_alternate_transport(
     policy: &PolicyInput,
 ) -> Option<(TransportKind, ClientIo)> {
     let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
-    let pinned = pinned_transport_active(policy);
-    let mut candidates: Vec<TransportKind> = default_transport_order()
-        .into_iter()
-        .filter(|candidate| *candidate != current)
-        .filter(|candidate| !transport_disabled_by_policy(policy, *candidate))
-        .collect();
-    if let Some(pinned_transport) = pinned
-        && pinned_transport != current
-        && !transport_disabled_by_policy(policy, pinned_transport)
-    {
-        candidates.retain(|candidate| *candidate != pinned_transport);
-        candidates.insert(0, pinned_transport);
-    }
+    let required = required_transport_active(policy);
+    let preferred = preferred_transport_active(policy);
+    let mut candidates: Vec<TransportKind> = if let Some(required_transport) = required {
+        if required_transport == current || transport_disabled_by_policy(policy, required_transport)
+        {
+            Vec::new()
+        } else {
+            vec![required_transport]
+        }
+    } else {
+        let ordered = default_transport_order()
+            .into_iter()
+            .filter(|candidate| *candidate != current)
+            .filter(|candidate| !transport_disabled_by_policy(policy, *candidate))
+            .collect();
+        reorder_with_preference(ordered, preferred)
+    };
     for (index, transport) in candidates.drain(..).enumerate() {
         let candidate_config = config.clone();
         let delay_ms = transport_start_delay_ms(config, transport, index);
@@ -3463,12 +3767,13 @@ mod tests {
     use super::{
         ClientContinuityState, MobilityTracker, build_transport_plan, default_transport_order,
         effective_min_dwell_secs, health_gate_passes, migration_blocked_by_cooldown,
-        pinned_transport_active, required_upgrade_windows,
+        preferred_transport_active, required_transport_active, required_upgrade_windows,
     };
     use std::collections::VecDeque;
     use tokio::time::{Duration, Instant};
     use warp_link_core::{
-        ClientConfig, DecisionWinnerLayer, PinnedTransport, PolicyInput, TransportKind, WireProfile,
+        ClientConfig, DecisionWinnerLayer, PolicyInput, TransportKind, TransportPreference,
+        WireProfile,
     };
 
     #[derive(Default)]
@@ -3592,36 +3897,57 @@ mod tests {
     }
 
     #[test]
-    fn pinned_transport_ignores_expired_pin() {
+    fn required_transport_ignores_expired_preference() {
         let policy = PolicyInput {
-            pinned_transport: Some(PinnedTransport {
+            required_transport: Some(TransportPreference {
                 transport: TransportKind::Quic,
                 expires_at_unix_ms: Some(1),
             }),
             ..PolicyInput::default()
         };
-        assert!(pinned_transport_active(&policy).is_none());
+        assert!(required_transport_active(&policy).is_none());
     }
 
     #[test]
-    fn build_transport_plan_respects_pin_transport() {
+    fn build_transport_plan_respects_required_transport() {
         let config = sample_client_config();
         let available = default_transport_order();
         if available.is_empty() {
             return;
         }
-        let pinned = available[0];
+        let required = available[0];
         let policy = PolicyInput {
-            pinned_transport: Some(PinnedTransport {
-                transport: pinned,
+            required_transport: Some(TransportPreference {
+                transport: required,
                 expires_at_unix_ms: None,
             }),
             ..PolicyInput::default()
         };
         let plan = build_transport_plan(&config, &policy);
         assert_eq!(plan.attempts.len(), 1);
-        assert_eq!(plan.attempts[0].0, pinned);
+        assert_eq!(plan.attempts[0].0, required);
         assert_eq!(plan.winner_layer, DecisionWinnerLayer::UserCommand);
+    }
+
+    #[test]
+    fn build_transport_plan_keeps_fallbacks_for_preferred_transport() {
+        let config = sample_client_config();
+        let available = default_transport_order();
+        if available.len() < 2 {
+            return;
+        }
+        let preferred = available[1];
+        let policy = PolicyInput {
+            preferred_transport: Some(TransportPreference {
+                transport: preferred,
+                expires_at_unix_ms: None,
+            }),
+            ..PolicyInput::default()
+        };
+        let plan = build_transport_plan(&config, &policy);
+        assert!(preferred_transport_active(&policy).is_some());
+        assert!(plan.attempts.len() >= 2);
+        assert_eq!(plan.attempts[0].0, preferred);
     }
 
     #[test]

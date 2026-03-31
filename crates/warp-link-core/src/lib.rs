@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::{Future, pending};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,17 +63,19 @@ pub struct DecisionTrace {
     pub suppressed_candidates: Vec<TransportKind>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PinnedTransport {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportPreference {
     pub transport: TransportKind,
     pub expires_at_unix_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PolicyInput {
     pub disabled_transports: Vec<TransportKind>,
-    pub pinned_transport: Option<PinnedTransport>,
-    pub force_reconnect_nonce: u64,
+    pub required_transport: Option<TransportPreference>,
+    pub preferred_transport: Option<TransportPreference>,
+    pub reconnect_epoch: u64,
+    pub control_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +512,12 @@ pub trait ClientApp: Send + Sync + 'static {
     }
     fn take_probe_request(&self) -> bool {
         false
+    }
+    fn wait_for_control_change(
+        &self,
+        _observed_control_epoch: u64,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(pending())
     }
 }
 
