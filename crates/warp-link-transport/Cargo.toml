@@ -2,6 +2,7 @@
 name = "warp-link-transport"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -19,7 +20,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
-warp-link-core = { path = "../warp-link-core" }
+warp-link-core = { version = "0.1.0", path = "../warp-link-core" }
 webpki-roots = { workspace = true }
 hex = { workspace = true }
 

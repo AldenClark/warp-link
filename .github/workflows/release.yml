@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Validate immutable release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace package versions differ") end')
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+          cargo test --locked --workspace --all-targets --all-features
+      - name: Audit dependencies
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo audit --deny warnings
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo deny check -D warnings advisories bans licenses sources
+      - name: Build reproducible source evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git archive --format=tar.gz \
+            --prefix="warp-link-${GITHUB_REF_NAME}/" \
+            --output="dist/warp-link-${GITHUB_REF_NAME}.tar.gz" \
+            HEAD
+          jq -n \
+            --arg tag "${GITHUB_REF_NAME}" \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg rustc "$(rustc --version --verbose | tr '\n' ';')" \
+            --arg cargo "$(cargo --version)" \
+            --arg lock_sha256 "$(sha256sum Cargo.lock | awk '{print $1}')" \
+            '{tag:$tag,commit:$commit,rustc:$rustc,cargo:$cargo,lock_sha256:$lock_sha256}' \
+            > dist/release-evidence.json
+          (cd dist && sha256sum warp-link-*.tar.gz release-evidence.json > SHA256SUMS)
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          dist/warp-link-*.tar.gz
+          dist/release-evidence.json
+          dist/SHA256SUMS
+          --verify-tag
+          --generate-notes

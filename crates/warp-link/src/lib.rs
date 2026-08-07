@@ -27,20 +27,21 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 #[cfg(any(feature = "tcp", feature = "wss"))]
 use tokio_rustls::TlsAcceptor;
 #[cfg(feature = "tcp")]
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 #[cfg(feature = "wss")]
 use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async,
+    WebSocketStream, accept_hdr_async_with_config,
     tungstenite::{
         Message as WsMessage,
         handshake::server::{
             ErrorResponse as WsErrorResponse, Request as WsRequest, Response as WsResponse,
         },
         http::StatusCode as WsStatusCode,
+        protocol::WebSocketConfig,
     },
 };
 use warp_link_core::{
@@ -59,7 +60,7 @@ use warp_link_transport::connect_tcp;
 #[cfg(feature = "wss")]
 use warp_link_transport::connect_wss;
 #[cfg(any(feature = "quic", feature = "tcp"))]
-use warp_link_transport::{read_prefixed_frame, write_prefixed_frame};
+use warp_link_transport::{FramedReader, write_prefixed_frame};
 
 pub use warp_link_core;
 pub use warp_link_transport;
@@ -143,6 +144,13 @@ fn transport_disabled_by_policy(policy: &PolicyInput, transport: TransportKind) 
 }
 
 fn default_transport_order() -> Vec<TransportKind> {
+    #[cfg_attr(
+        not(any(feature = "quic", feature = "tcp", feature = "wss")),
+        expect(
+            unused_mut,
+            reason = "the vector is immutable only when every transport feature is disabled"
+        )
+    )]
     let mut order = Vec::new();
     #[cfg(feature = "quic")]
     {
@@ -690,14 +698,26 @@ pub async fn client_run_with_shutdown(
         if *shutdown.borrow() {
             return Ok(());
         }
-        match run_client_session_once(&config, Arc::clone(&app), &mut continuity).await {
+        let session_result = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+                continue;
+            }
+            result = run_client_session_once(&config, Arc::clone(&app), &mut continuity) => result,
+        };
+        match session_result {
             Ok(()) => {
                 attempt = 0;
             }
             Err(err) => {
-                let _ = app.on_event(ClientEvent::Fatal {
-                    error: err.to_string(),
-                });
+                if !matches!(err, WarpLinkError::Reconnect(_)) {
+                    let _ = app.on_event(ClientEvent::Fatal {
+                        error: err.to_string(),
+                    });
+                }
                 attempt = attempt.saturating_add(1);
                 let exp = attempt.saturating_sub(1).min(8);
                 let base_backoff = config
@@ -861,6 +881,7 @@ async fn run_client_session_once(
             }
         };
     };
+    validate_welcome_negotiation(&inband_hello_snapshot, &welcome)?;
     let _ = app.on_event(ClientEvent::Welcome {
         welcome: welcome.clone(),
     });
@@ -1376,7 +1397,7 @@ async fn run_client_session_once(
             },
         };
 
-        let control = handle_primary_frame(
+        handle_primary_frame(
             config,
             Arc::clone(&app),
             transport,
@@ -1392,15 +1413,63 @@ async fn run_client_session_once(
             },
         )
         .await?;
-        if matches!(control, FrameLoopControl::TerminateOk) {
-            return Ok(());
-        }
     }
 }
 
-enum FrameLoopControl {
-    Continue,
-    TerminateOk,
+fn ack_status_for_decision(decision: AppDecision) -> Result<Option<AckStatus>, WarpLinkError> {
+    match decision {
+        AppDecision::AckOk => Ok(Some(AckStatus::Ok)),
+        AppDecision::AckInvalidPayload => Ok(Some(AckStatus::InvalidPayload)),
+        AppDecision::RetryLater => Err(WarpLinkError::Reconnect(
+            "application requested delivery retry".to_string(),
+        )),
+        AppDecision::Ignore => Ok(None),
+    }
+}
+
+fn validate_welcome_negotiation(
+    hello: &HelloCtx,
+    welcome: &warp_link_core::WelcomeMsg,
+) -> Result<(), WarpLinkError> {
+    if !hello.supported_wire_versions.is_empty()
+        && !hello
+            .supported_wire_versions
+            .contains(&welcome.negotiated_wire_version)
+    {
+        return Err(WarpLinkError::Wire(
+            warp_link_core::WireError::VersionIncompatible(format!(
+                "server selected unsupported wire version {}",
+                welcome.negotiated_wire_version
+            )),
+        ));
+    }
+    if !hello.supported_payload_versions.is_empty()
+        && !hello
+            .supported_payload_versions
+            .contains(&welcome.negotiated_payload_version)
+    {
+        return Err(WarpLinkError::Wire(
+            warp_link_core::WireError::VersionIncompatible(format!(
+                "server selected unsupported payload version {}",
+                welcome.negotiated_payload_version
+            )),
+        ));
+    }
+    if !(2..=TRANSPORT_MAX_FRAME_BYTES).contains(&welcome.max_frame_bytes) {
+        return Err(WarpLinkError::Protocol(format!(
+            "server selected invalid max frame bytes {}",
+            welcome.max_frame_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn classify_primary_goaway(reason: String) -> WarpLinkError {
+    if reason.starts_with("auth_expired") || reason.starts_with("auth_revoked") {
+        WarpLinkError::Auth(AuthError::Unauthorized(reason))
+    } else {
+        WarpLinkError::Reconnect(format!("server goaway: {reason}"))
+    }
 }
 
 struct PrimaryFrameState<'a> {
@@ -1428,7 +1497,7 @@ async fn handle_primary_frame(
     transport: TransportKind,
     frame: Vec<u8>,
     state: PrimaryFrameState<'_>,
-) -> Result<FrameLoopControl, WarpLinkError> {
+) -> Result<(), WarpLinkError> {
     let PrimaryFrameState {
         continuity,
         power_runtime,
@@ -1450,11 +1519,7 @@ async fn handle_primary_frame(
                 },
             )
             .await?;
-            let status = match decision {
-                AppDecision::AckOk => Some(AckStatus::Ok),
-                AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
-                AppDecision::Ignore => None,
-            };
+            let status = ack_status_for_decision(decision)?;
             if let Some(status) = status {
                 let ack = AckMsg {
                     seq: msg.seq,
@@ -1467,13 +1532,13 @@ async fn handle_primary_frame(
                 continuity.note_acked_seq(msg.seq);
                 health_tracker.note_ack(status, Instant::now());
             }
-            Ok(FrameLoopControl::Continue)
+            Ok(())
         }
         DecodedServerFrame::Ping => {
             health_tracker.note_frame_progress(Instant::now());
             let pong = config.wire_profile.encode_client_pong();
             io.send_frame(&pong, config.policy.write_timeout_ms).await?;
-            Ok(FrameLoopControl::Continue)
+            Ok(())
         }
         DecodedServerFrame::Pong => {
             health_tracker.note_frame_progress(Instant::now());
@@ -1492,7 +1557,7 @@ async fn handle_primary_frame(
                     source,
                 });
             }
-            Ok(FrameLoopControl::Continue)
+            Ok(())
         }
         DecodedServerFrame::GoAway(reason) => {
             mobility_tracker.note_disconnect(Instant::now());
@@ -1501,15 +1566,7 @@ async fn handle_primary_frame(
                 transport,
                 reason: goaway_reason.clone(),
             });
-            if goaway_reason.starts_with("auth_expired")
-                || goaway_reason.starts_with("auth_revoked")
-            {
-                return Err(WarpLinkError::Auth(AuthError::Unauthorized(goaway_reason)));
-            }
-            if goaway_reason.starts_with("auth_refresh_required") {
-                return Ok(FrameLoopControl::TerminateOk);
-            }
-            Ok(FrameLoopControl::TerminateOk)
+            Err(classify_primary_goaway(goaway_reason))
         }
         DecodedServerFrame::Error { code, message } => Err(WarpLinkError::Protocol(format!(
             "gateway error: {code} {message}"
@@ -1517,7 +1574,7 @@ async fn handle_primary_frame(
         DecodedServerFrame::Welcome(_) => Err(WarpLinkError::Protocol(
             "unexpected welcome frame after handshake".to_string(),
         )),
-        DecodedServerFrame::Unknown => Ok(FrameLoopControl::Continue),
+        DecodedServerFrame::Unknown => Ok(()),
     }
 }
 
@@ -1613,7 +1670,10 @@ async fn commit_candidate_cutover(
         return Ok(None);
     }
 
-    spawn_old_primary_drain(config.clone(), Arc::clone(&app), from_transport, old_io);
+    // Closing the old transport is loss-safe: anything not ACKed on it is redelivered via
+    // the resume cursor. Keeping a detached drain task would outlive client shutdown and
+    // could also ACK a later sequence while the new primary is still committing an earlier one.
+    drop(old_io);
     emit_scheduler_state(
         app.as_ref(),
         SchedulerState::PrimaryActive,
@@ -1645,11 +1705,7 @@ async fn cutover_guard(
                 },
             )
             .await?;
-            let status = match decision {
-                AppDecision::AckOk => Some(AckStatus::Ok),
-                AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
-                AppDecision::Ignore => None,
-            };
+            let status = ack_status_for_decision(decision)?;
             if let Some(status) = status {
                 let ack = AckMsg {
                     seq: msg.seq,
@@ -1680,76 +1736,6 @@ async fn cutover_guard(
             "unexpected welcome during cutover guard".to_string(),
         )),
     }
-}
-
-fn spawn_old_primary_drain(
-    config: ClientConfig,
-    app: Arc<dyn ClientApp>,
-    transport: TransportKind,
-    mut io: ClientIo,
-) {
-    if config.policy.drain_timeout_ms == 0 {
-        return;
-    }
-    let drain_timeout_ms = config.policy.drain_timeout_ms;
-    tokio::spawn(async move {
-        let deadline = Instant::now() + Duration::from_millis(drain_timeout_ms);
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remain_ms = duration_ms(deadline.saturating_duration_since(now)).min(400);
-            let frame = match io.recv_frame(remain_ms).await {
-                Ok(frame) => frame,
-                Err(WarpLinkError::Timeout(_)) => break,
-                Err(_) => break,
-            };
-            let decoded = match config.wire_profile.decode_server_frame(&frame) {
-                Ok(value) => value,
-                Err(_) => break,
-            };
-            match decoded {
-                DecodedServerFrame::Deliver(msg) => {
-                    let decision = match dispatch_blocking_client_event(
-                        Arc::clone(&app),
-                        ClientEvent::Message {
-                            transport,
-                            msg: msg.clone(),
-                        },
-                    )
-                    .await
-                    {
-                        Ok(decision) => decision,
-                        Err(_) => break,
-                    };
-                    let status = match decision {
-                        AppDecision::AckOk => Some(AckStatus::Ok),
-                        AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
-                        AppDecision::Ignore => None,
-                    };
-                    if let Some(status) = status {
-                        let ack = AckMsg {
-                            seq: msg.seq,
-                            id: msg.id,
-                            status,
-                        };
-                        if let Ok(bytes) = config.wire_profile.encode_client_ack(&ack) {
-                            let _ = io.send_frame(&bytes, config.policy.write_timeout_ms).await;
-                        }
-                    }
-                }
-                DecodedServerFrame::Ping => {
-                    let pong = config.wire_profile.encode_client_pong();
-                    let _ = io.send_frame(&pong, config.policy.write_timeout_ms).await;
-                }
-                DecodedServerFrame::GoAway(_) | DecodedServerFrame::Error { .. } => break,
-                DecodedServerFrame::Pong
-                | DecodedServerFrame::Welcome(_)
-                | DecodedServerFrame::Unknown => {}
-            }
-        }
-    });
 }
 
 struct ClientPowerRuntime {
@@ -2246,6 +2232,7 @@ async fn initialize_candidate_transport(
             ));
         }
     };
+    validate_welcome_negotiation(&hello, &welcome)?;
     let _ = app.on_event(ClientEvent::Connected {
         transport: io_transport_kind(io),
     });
@@ -2267,6 +2254,8 @@ async fn connect_transport(
     config: &ClientConfig,
     transport: TransportKind,
 ) -> Result<ClientIo, WarpLinkError> {
+    #[cfg(not(any(feature = "quic", feature = "tcp", feature = "wss")))]
+    let _ = config;
     match transport {
         #[cfg(feature = "quic")]
         TransportKind::Quic => connect_quic(config).await,
@@ -2443,11 +2432,22 @@ pub async fn run_server_session(
     peer: PeerMeta,
 ) -> Result<(), WarpLinkError> {
     let profile = app.wire_profile();
-    let hello_frame = match io.recv_frame(config.hello_timeout_ms).await {
-        Ok(frame) => frame,
-        Err(err) => {
+    let handshake_deadline = Instant::now() + Duration::from_millis(config.hello_timeout_ms.max(1));
+    let hello_frame = match timeout_at(
+        handshake_deadline,
+        io.recv_frame(config.hello_timeout_ms.max(1)),
+    )
+    .await
+    {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => {
             app.on_handshake_failure(peer.clone(), &err).await;
             return Err(err);
+        }
+        Err(_) => {
+            let error = WarpLinkError::Timeout("server hello deadline exceeded".to_string());
+            app.on_handshake_failure(peer.clone(), &error).await;
+            return Err(error);
         }
     };
     let hello = match profile.decode_client_frame(&hello_frame) {
@@ -2457,7 +2457,7 @@ pub async fn run_server_session(
             app.on_handshake_failure(peer.clone(), &protocol_error)
                 .await;
             let err = profile.encode_server_error("invalid_frame", "expected client hello")?;
-            let _ = io.send_frame(&err).await;
+            let _ = timeout_at(handshake_deadline, io.send_frame(&err)).await;
             return Ok(());
         }
         Err(err) => {
@@ -2466,62 +2466,27 @@ pub async fn run_server_session(
             return Err(wire);
         }
     };
-    let mut active_lease = if let Some(coordinator) = app.session_coordinator() {
-        let Some(owner) = app.session_coord_owner() else {
-            let error =
-                WarpLinkError::Internal("session coordinator owner is required".to_string());
-            app.on_handshake_failure(peer.clone(), &error).await;
-            return Err(error);
-        };
-        let key = app
-            .session_coord_key(&hello)
-            .unwrap_or_else(|| hello.identity.clone());
-        let lease = match coordinator
-            .acquire(
-                key.as_str(),
-                owner.as_str(),
-                config.coord_lease_ttl_secs.max(1),
-            )
-            .await
-        {
-            Ok(lease) => lease,
-            Err(err) => {
-                let (public_code, public_message) = match &err {
-                    warp_link_core::CoordinationError::Conflict(_) => {
-                        ("lease_conflict", "lease_conflict")
-                    }
-                    warp_link_core::CoordinationError::Backend(_) => {
-                        ("lease_unavailable", "lease_unavailable")
-                    }
-                };
-                let error: WarpLinkError = err.into();
-                app.on_handshake_failure(peer.clone(), &error).await;
-                if let Ok(frame) = profile.encode_server_error(public_code, public_message) {
-                    let _ = io.send_frame(&frame).await;
-                }
-                return Err(error);
-            }
-        };
-        Some(ActiveLease {
-            coordinator,
-            key,
-            owner,
-            epoch: lease.epoch,
-            expires_at_unix_secs: lease.expires_at_unix_secs,
-        })
-    } else {
-        None
-    };
+    let mut active_lease = None;
     let result = async {
-        let mut session = match app
-            .auth(AuthRequest {
+        let connect_auth = match timeout_at(
+            handshake_deadline,
+            app.auth(AuthRequest {
                 phase: AuthCheckPhase::Connect,
                 session: None,
                 hello: Some(hello.clone()),
                 peer: Some(peer.clone()),
-            })
-            .await
+            }),
+        )
+        .await
         {
+            Ok(result) => result,
+            Err(_) => {
+                let error = WarpLinkError::Timeout("server auth deadline exceeded".to_string());
+                app.on_handshake_failure(peer.clone(), &error).await;
+                return Err(error);
+            }
+        };
+        let mut session = match connect_auth {
             Ok(AuthResponse::ConnectAccepted(session)) => session,
             Ok(AuthResponse::State(state)) => {
                 let public_message = public_auth_state_message(&state);
@@ -2530,7 +2495,7 @@ pub async fn run_server_session(
                 let auth_error: WarpLinkError = AuthError::Unauthorized(reason.clone()).into();
                 app.on_handshake_failure(peer.clone(), &auth_error).await;
                 if let Ok(frame) = profile.encode_server_error("auth_failed", public_message) {
-                    let _ = io.send_frame(&frame).await;
+                    let _ = timeout_at(handshake_deadline, io.send_frame(&frame)).await;
                 }
                 return Err(auth_error);
             }
@@ -2539,11 +2504,64 @@ pub async fn run_server_session(
                 let auth_error: WarpLinkError = err.clone().into();
                 app.on_handshake_failure(peer.clone(), &auth_error).await;
                 if let Ok(frame) = profile.encode_server_error("auth_failed", public_message) {
-                    let _ = io.send_frame(&frame).await;
+                    let _ = timeout_at(handshake_deadline, io.send_frame(&frame)).await;
                 }
                 return Err(auth_error);
             }
         };
+        if let Some(coordinator) = app.session_coordinator() {
+            let Some(owner) = app.session_coord_owner() else {
+                let error =
+                    WarpLinkError::Internal("session coordinator owner is required".to_string());
+                app.on_handshake_failure(peer.clone(), &error).await;
+                return Err(error);
+            };
+            let key = app
+                .session_coord_key(&hello)
+                .unwrap_or_else(|| session.identity.clone());
+            let lease = match timeout_at(
+                handshake_deadline,
+                coordinator.acquire(
+                    key.as_str(),
+                    owner.as_str(),
+                    config.coord_lease_ttl_secs.max(1),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(lease)) => lease,
+                Ok(Err(err)) => {
+                    let (public_code, public_message) = match &err {
+                        warp_link_core::CoordinationError::Conflict(_) => {
+                            ("lease_conflict", "lease_conflict")
+                        }
+                        warp_link_core::CoordinationError::Backend(_) => {
+                            ("lease_unavailable", "lease_unavailable")
+                        }
+                    };
+                    let error: WarpLinkError = err.into();
+                    app.on_handshake_failure(peer.clone(), &error).await;
+                    if let Ok(frame) = profile.encode_server_error(public_code, public_message) {
+                        let _ = timeout_at(handshake_deadline, io.send_frame(&frame)).await;
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    let error = WarpLinkError::Timeout(
+                        "server session coordination deadline exceeded".to_string(),
+                    );
+                    app.on_handshake_failure(peer.clone(), &error).await;
+                    return Err(error);
+                }
+            };
+            active_lease = Some(ActiveLease {
+                coordinator,
+                key,
+                owner,
+                epoch: lease.epoch,
+                expires_at_unix_secs: lease.expires_at_unix_secs,
+            });
+        }
         session.max_frame_bytes = session.max_frame_bytes.clamp(2, TRANSPORT_MAX_FRAME_BYTES);
         if let Some(lease) = active_lease.as_ref() {
             session
@@ -2580,10 +2598,19 @@ pub async fn run_server_session(
                 return Err(error);
             }
         };
-        if let Err(err) = io.send_frame(&welcome_frame).await {
-            app.on_disconnect(&session, DisconnectReason::TransportError(err.to_string()))
-                .await;
-            return Err(err);
+        match timeout_at(handshake_deadline, io.send_frame(&welcome_frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                app.on_disconnect(&session, DisconnectReason::TransportError(err.to_string()))
+                    .await;
+                return Err(err);
+            }
+            Err(_) => {
+                let error = WarpLinkError::Timeout("server welcome deadline exceeded".to_string());
+                app.on_disconnect(&session, DisconnectReason::TransportError(error.to_string()))
+                    .await;
+                return Err(error);
+            }
         }
 
         session.auth_refresh_before_secs = normalize_refresh_before(
@@ -3021,38 +3048,52 @@ pub async fn serve_quic_with_app(
         let Some(incoming) = endpoint.accept().await else {
             return Ok(());
         };
+        let remote = incoming.remote_address().to_string();
+        let permit = match Arc::clone(&session_limiter).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let peer = PeerMeta {
+                    transport: TransportKind::Quic,
+                    remote_addr: Some(remote),
+                };
+                let error = WarpLinkError::Transport(
+                    "server busy: concurrent session limit reached".to_string(),
+                );
+                app.on_handshake_failure(peer, &error).await;
+                continue;
+            }
+        };
         let app_clone = Arc::clone(&app);
         let cfg_clone = config.clone();
-        let limiter = Arc::clone(&session_limiter);
         tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(conn) => conn,
-                Err(err) => {
+            let _permit = permit;
+            let conn = match timeout(
+                Duration::from_millis(cfg_clone.hello_timeout_ms.max(1)),
+                incoming,
+            )
+            .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(err)) => {
                     let peer = PeerMeta {
                         transport: TransportKind::Quic,
-                        remote_addr: None,
+                        remote_addr: Some(remote),
                     };
                     let error = WarpLinkError::Transport(err.to_string());
                     app_clone.on_handshake_failure(peer, &error).await;
                     return;
                 }
-            };
-            let remote = conn.remote_address().to_string();
-            let permit = match limiter.try_acquire_owned() {
-                Ok(permit) => permit,
                 Err(_) => {
                     let peer = PeerMeta {
                         transport: TransportKind::Quic,
                         remote_addr: Some(remote),
                     };
-                    let error = WarpLinkError::Transport(
-                        "server busy: concurrent session limit reached".to_string(),
-                    );
+                    let error = WarpLinkError::Timeout("quic handshake timeout".to_string());
                     app_clone.on_handshake_failure(peer, &error).await;
                     return;
                 }
             };
-            let _permit = permit;
+            let remote = conn.remote_address().to_string();
             loop {
                 let bi = timeout(
                     Duration::from_millis(cfg_clone.hello_timeout_ms),
@@ -3083,7 +3124,7 @@ pub async fn serve_quic_with_app(
                 };
                 let mut io = QuicServerIo {
                     send,
-                    recv,
+                    recv: FramedReader::new(recv),
                     write_timeout_ms: cfg_clone.write_timeout_ms,
                 };
                 let peer = PeerMeta {
@@ -3165,9 +3206,14 @@ pub async fn serve_tcp_with_app(
         let acceptor_clone = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            let tls = match acceptor_clone.accept(socket).await {
-                Ok(tls) => tls,
-                Err(err) => {
+            let tls = match timeout(
+                Duration::from_millis(cfg_clone.hello_timeout_ms.max(1)),
+                acceptor_clone.accept(socket),
+            )
+            .await
+            {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(err)) => {
                     let peer = PeerMeta {
                         transport: TransportKind::Tcp,
                         remote_addr: Some(remote_addr.to_string()),
@@ -3176,10 +3222,19 @@ pub async fn serve_tcp_with_app(
                     app_clone.on_handshake_failure(peer, &error).await;
                     return;
                 }
+                Err(_) => {
+                    let peer = PeerMeta {
+                        transport: TransportKind::Tcp,
+                        remote_addr: Some(remote_addr.to_string()),
+                    };
+                    let error = WarpLinkError::Timeout("tcp tls handshake timeout".to_string());
+                    app_clone.on_handshake_failure(peer, &error).await;
+                    return;
+                }
             };
             let (reader, writer) = tokio::io::split(tls);
             let mut io = TcpServerIo {
-                reader,
+                reader: FramedReader::new(reader),
                 writer,
                 write_timeout_ms: cfg_clone.write_timeout_ms,
             };
@@ -3253,7 +3308,7 @@ pub async fn serve_tcp_plain_with_app(
             let _permit = permit;
             let (reader, writer) = tokio::io::split(socket);
             let mut io = PlainTcpServerIo {
-                reader,
+                reader: FramedReader::new(reader),
                 writer,
                 write_timeout_ms: cfg_clone.write_timeout_ms,
             };
@@ -3418,13 +3473,20 @@ pub async fn serve_wss_standalone_with_app(
         let app_clone = Arc::clone(&app);
         let path = wss.path.clone();
         let subprotocol = wss.subprotocol.clone();
-        let max_frame_bytes = wss.max_frame_bytes.max(2);
+        let max_frame_bytes = wss
+            .max_frame_bytes
+            .clamp(2, TRANSPORT_MAX_FRAME_BYTES as usize);
         let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
             if let Some(acceptor) = tls_acceptor {
-                match acceptor.accept(socket).await {
-                    Ok(tls_stream) => {
+                match timeout(
+                    Duration::from_millis(cfg_clone.hello_timeout_ms.max(1)),
+                    acceptor.accept(socket),
+                )
+                .await
+                {
+                    Ok(Ok(tls_stream)) => {
                         run_standalone_wss_session(
                             tls_stream,
                             path.as_str(),
@@ -3436,12 +3498,20 @@ pub async fn serve_wss_standalone_with_app(
                         )
                         .await;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         let peer = PeerMeta {
                             transport: TransportKind::Wss,
                             remote_addr: Some(remote_addr.to_string()),
                         };
                         let err = WarpLinkError::Transport(error.to_string());
+                        app_clone.on_handshake_failure(peer, &err).await;
+                    }
+                    Err(_) => {
+                        let peer = PeerMeta {
+                            transport: TransportKind::Wss,
+                            remote_addr: Some(remote_addr.to_string()),
+                        };
+                        let err = WarpLinkError::Timeout("wss tls handshake timeout".to_string());
                         app_clone.on_handshake_failure(peer, &err).await;
                     }
                 }
@@ -3475,7 +3545,7 @@ pub async fn serve_wss_standalone_with_app(
 #[cfg(feature = "quic")]
 struct QuicServerIo {
     send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    recv: FramedReader<quinn::RecvStream>,
     write_timeout_ms: u64,
 }
 
@@ -3493,18 +3563,15 @@ impl ServerSessionIo for QuicServerIo {
     }
 
     async fn recv_frame(&mut self, timeout_ms: u64) -> Result<Vec<u8>, WarpLinkError> {
-        timeout(
-            Duration::from_millis(timeout_ms),
-            read_prefixed_frame(&mut self.recv),
-        )
-        .await
-        .map_err(|_| WarpLinkError::Timeout("quic read timeout".to_string()))?
+        timeout(Duration::from_millis(timeout_ms), self.recv.read_frame())
+            .await
+            .map_err(|_| WarpLinkError::Timeout("quic read timeout".to_string()))?
     }
 }
 
 #[cfg(feature = "tcp")]
 struct TcpServerIo {
-    reader: ReadHalf<ServerTlsStream<TcpStream>>,
+    reader: FramedReader<ReadHalf<ServerTlsStream<TcpStream>>>,
     writer: WriteHalf<ServerTlsStream<TcpStream>>,
     write_timeout_ms: u64,
 }
@@ -3523,18 +3590,15 @@ impl ServerSessionIo for TcpServerIo {
     }
 
     async fn recv_frame(&mut self, timeout_ms: u64) -> Result<Vec<u8>, WarpLinkError> {
-        timeout(
-            Duration::from_millis(timeout_ms),
-            read_prefixed_frame(&mut self.reader),
-        )
-        .await
-        .map_err(|_| WarpLinkError::Timeout("tcp read timeout".to_string()))?
+        timeout(Duration::from_millis(timeout_ms), self.reader.read_frame())
+            .await
+            .map_err(|_| WarpLinkError::Timeout("tcp read timeout".to_string()))?
     }
 }
 
 #[cfg(feature = "tcp")]
 struct PlainTcpServerIo {
-    reader: ReadHalf<TcpStream>,
+    reader: FramedReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
     write_timeout_ms: u64,
 }
@@ -3553,12 +3617,9 @@ impl ServerSessionIo for PlainTcpServerIo {
     }
 
     async fn recv_frame(&mut self, timeout_ms: u64) -> Result<Vec<u8>, WarpLinkError> {
-        timeout(
-            Duration::from_millis(timeout_ms),
-            read_prefixed_frame(&mut self.reader),
-        )
-        .await
-        .map_err(|_| WarpLinkError::Timeout("tcp read timeout".to_string()))?
+        timeout(Duration::from_millis(timeout_ms), self.reader.read_frame())
+            .await
+            .map_err(|_| WarpLinkError::Timeout("tcp read timeout".to_string()))?
     }
 }
 
@@ -3602,9 +3663,19 @@ async fn run_standalone_wss_session<S>(
         transport: TransportKind::Wss,
         remote_addr: Some(remote_addr.clone()),
     };
-    let ws = match accept_standalone_wss(stream, path, expected_subprotocol).await {
-        Ok(ws) => ws,
-        Err(err) => {
+    let ws = match timeout(
+        Duration::from_millis(config.hello_timeout_ms.max(1)),
+        accept_standalone_wss(stream, path, expected_subprotocol, max_frame_bytes),
+    )
+    .await
+    {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(err)) => {
+            app.on_handshake_failure(peer, &err).await;
+            return;
+        }
+        Err(_) => {
+            let err = WarpLinkError::Timeout("wss upgrade timeout".to_string());
             app.on_handshake_failure(peer, &err).await;
             return;
         }
@@ -3626,24 +3697,35 @@ async fn accept_standalone_wss<S>(
     stream: S,
     expected_path: &str,
     expected_subprotocol: Option<&str>,
+    max_frame_bytes: usize,
 ) -> Result<WebSocketStream<S>, WarpLinkError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let expected = expected_path.to_string();
     let expected_subprotocol = expected_subprotocol.map(|value| value.to_string());
-    accept_hdr_async(stream, move |request: &WsRequest, response: WsResponse| {
-        let mut response = response;
-        if let Some(err) = validate_wss_upgrade_request(
-            request,
-            &mut response,
-            expected.as_str(),
-            expected_subprotocol.as_deref(),
-        ) {
-            return Err(err);
-        }
-        Ok(response)
-    })
+    let websocket_config = WebSocketConfig::default()
+        .read_buffer_size(max_frame_bytes.min(16 * 1024))
+        .write_buffer_size(max_frame_bytes.min(16 * 1024))
+        .max_write_buffer_size(max_frame_bytes.saturating_mul(2).max(2))
+        .max_message_size(Some(max_frame_bytes))
+        .max_frame_size(Some(max_frame_bytes));
+    accept_hdr_async_with_config(
+        stream,
+        move |request: &WsRequest, response: WsResponse| {
+            let mut response = response;
+            if let Some(err) = validate_wss_upgrade_request(
+                request,
+                &mut response,
+                expected.as_str(),
+                expected_subprotocol.as_deref(),
+            ) {
+                return Err(err);
+            }
+            Ok(response)
+        },
+        Some(websocket_config),
+    )
     .await
     .map_err(|e| WarpLinkError::Protocol(format!("wss upgrade failed: {e}")))
 }
@@ -3820,15 +3902,24 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>, WarpLinkError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientContinuityState, MobilityTracker, build_transport_plan, default_transport_order,
-        effective_min_dwell_secs, health_gate_passes, migration_blocked_by_cooldown,
-        preferred_transport_active, required_transport_active, required_upgrade_windows,
+        ClientContinuityState, MobilityTracker, ServerSessionIo, TRANSPORT_MAX_FRAME_BYTES,
+        ack_status_for_decision, build_transport_plan, classify_primary_goaway,
+        default_transport_order, effective_min_dwell_secs, health_gate_passes,
+        migration_blocked_by_cooldown, preferred_transport_active, required_transport_active,
+        required_upgrade_windows, run_server_session, validate_welcome_negotiation,
     };
+    use async_trait::async_trait;
+    use pushgo_warp_profile::PushgoWireProfile;
     use std::collections::VecDeque;
+    use std::future::pending;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Duration, Instant};
     use warp_link_core::{
-        ClientConfig, DecisionWinnerLayer, PolicyInput, TransportKind, TransportPreference,
-        WireProfile,
+        AckMsg, AppDecision, AuthCheckPhase, AuthError, AuthRequest, AuthResponse, ClientConfig,
+        CoordinationError, DecisionWinnerLayer, DisconnectReason, OutboundMsg, PeerMeta,
+        PolicyInput, ServerApp, ServerConfig, SessionCoordinator, SessionCtx, SessionLease,
+        TransportKind, TransportPreference, WarpLinkError, WireProfile,
     };
 
     #[derive(Default)]
@@ -3928,6 +4019,251 @@ mod tests {
             policy: warp_link_core::ClientPolicy::default(),
             wire_profile: std::sync::Arc::new(NoopProfile),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestAuthMode {
+        Pending,
+        DelayThenAccept(Duration),
+    }
+
+    struct DeadlineTestCoordinator {
+        acquire_calls: AtomicUsize,
+    }
+
+    impl DeadlineTestCoordinator {
+        fn new() -> Self {
+            Self {
+                acquire_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionCoordinator for DeadlineTestCoordinator {
+        async fn acquire(
+            &self,
+            _key: &str,
+            _owner: &str,
+            _ttl_secs: u64,
+        ) -> Result<SessionLease, CoordinationError> {
+            self.acquire_calls.fetch_add(1, Ordering::SeqCst);
+            pending().await
+        }
+
+        async fn renew(
+            &self,
+            _key: &str,
+            _owner: &str,
+            _epoch: u64,
+            _ttl_secs: u64,
+        ) -> Result<SessionLease, CoordinationError> {
+            panic!("renew must not run during handshake deadline tests")
+        }
+
+        async fn release(
+            &self,
+            _key: &str,
+            _owner: &str,
+            _epoch: u64,
+        ) -> Result<(), CoordinationError> {
+            panic!("release must not run before a lease is acquired")
+        }
+    }
+
+    struct DeadlineTestApp {
+        profile: Arc<PushgoWireProfile>,
+        auth_mode: TestAuthMode,
+        coordinator: Option<Arc<DeadlineTestCoordinator>>,
+    }
+
+    #[async_trait]
+    impl ServerApp for DeadlineTestApp {
+        fn wire_profile(&self) -> Arc<dyn WireProfile> {
+            Arc::clone(&self.profile) as Arc<dyn WireProfile>
+        }
+
+        async fn auth(&self, request: AuthRequest) -> Result<AuthResponse, AuthError> {
+            assert_eq!(request.phase, AuthCheckPhase::Connect);
+            match self.auth_mode {
+                TestAuthMode::Pending => pending().await,
+                TestAuthMode::DelayThenAccept(delay) => {
+                    tokio::time::sleep(delay).await;
+                    Ok(AuthResponse::ConnectAccepted(test_session()))
+                }
+            }
+        }
+
+        async fn wait_outbound(
+            &self,
+            _session: &SessionCtx,
+            _max_wait_ms: u64,
+        ) -> Option<OutboundMsg> {
+            pending().await
+        }
+
+        async fn on_ack(&self, _session: &SessionCtx, _ack: AckMsg) {}
+
+        async fn on_disconnect(&self, _session: &SessionCtx, _reason: DisconnectReason) {}
+
+        fn session_coordinator(&self) -> Option<Arc<dyn SessionCoordinator>> {
+            self.coordinator
+                .as_ref()
+                .map(|coordinator| Arc::clone(coordinator) as Arc<dyn SessionCoordinator>)
+        }
+
+        fn session_coord_owner(&self) -> Option<String> {
+            Some("deadline-test-owner".to_string())
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestSendMode {
+        Ready,
+        Pending,
+    }
+
+    struct DeadlineTestIo {
+        hello_frame: Option<Vec<u8>>,
+        send_mode: TestSendMode,
+        send_calls: usize,
+    }
+
+    #[async_trait]
+    impl ServerSessionIo for DeadlineTestIo {
+        async fn send_frame(&mut self, _frame: &[u8]) -> Result<(), WarpLinkError> {
+            self.send_calls += 1;
+            match self.send_mode {
+                TestSendMode::Ready => Ok(()),
+                TestSendMode::Pending => pending().await,
+            }
+        }
+
+        async fn recv_frame(&mut self, _timeout_ms: u64) -> Result<Vec<u8>, WarpLinkError> {
+            self.hello_frame.take().ok_or_else(|| {
+                WarpLinkError::Transport("test hello frame already consumed".to_string())
+            })
+        }
+    }
+
+    fn test_session() -> SessionCtx {
+        SessionCtx {
+            session_id: "deadline-test-session".to_string(),
+            identity: "deadline-test-device".to_string(),
+            resume_token: None,
+            heartbeat_secs: 30,
+            ping_interval_secs: 15,
+            idle_timeout_secs: 60,
+            max_backoff_secs: 30,
+            auth_expires_at_unix_secs: None,
+            auth_refresh_before_secs: 0,
+            max_frame_bytes: TRANSPORT_MAX_FRAME_BYTES,
+            negotiated_wire_version: 2,
+            negotiated_payload_version: 1,
+            metadata: Default::default(),
+        }
+    }
+
+    fn test_hello_frame(profile: &PushgoWireProfile) -> Vec<u8> {
+        profile
+            .encode_client_hello(&warp_link_core::HelloCtx {
+                identity: "deadline-test-device".to_string(),
+                supported_wire_versions: vec![2],
+                supported_payload_versions: vec![1],
+                ..warp_link_core::HelloCtx::default()
+            })
+            .expect("test hello should encode")
+            .to_vec()
+    }
+
+    fn deadline_test_config() -> ServerConfig {
+        ServerConfig {
+            hello_timeout_ms: 100,
+            ..ServerConfig::default()
+        }
+    }
+
+    fn deadline_test_peer() -> PeerMeta {
+        PeerMeta {
+            transport: TransportKind::Tcp,
+            remote_addr: Some("127.0.0.1:12345".to_string()),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auth_timeout_does_not_touch_the_session_coordinator() {
+        let profile = Arc::new(PushgoWireProfile::new());
+        let coordinator = Arc::new(DeadlineTestCoordinator::new());
+        let app = Arc::new(DeadlineTestApp {
+            profile: Arc::clone(&profile),
+            auth_mode: TestAuthMode::Pending,
+            coordinator: Some(Arc::clone(&coordinator)),
+        });
+        let mut io = DeadlineTestIo {
+            hello_frame: Some(test_hello_frame(profile.as_ref())),
+            send_mode: TestSendMode::Ready,
+            send_calls: 0,
+        };
+        let start = Instant::now();
+
+        let error = run_server_session(&deadline_test_config(), app, &mut io, deadline_test_peer())
+            .await
+            .expect_err("pending auth must consume the handshake deadline");
+
+        assert!(matches!(error, WarpLinkError::Timeout(_)));
+        assert_eq!(Instant::now() - start, Duration::from_millis(100));
+        assert_eq!(coordinator.acquire_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(io.send_calls, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coordinator_acquire_uses_the_remaining_handshake_deadline() {
+        let profile = Arc::new(PushgoWireProfile::new());
+        let coordinator = Arc::new(DeadlineTestCoordinator::new());
+        let app = Arc::new(DeadlineTestApp {
+            profile: Arc::clone(&profile),
+            auth_mode: TestAuthMode::DelayThenAccept(Duration::from_millis(60)),
+            coordinator: Some(Arc::clone(&coordinator)),
+        });
+        let mut io = DeadlineTestIo {
+            hello_frame: Some(test_hello_frame(profile.as_ref())),
+            send_mode: TestSendMode::Ready,
+            send_calls: 0,
+        };
+        let start = Instant::now();
+
+        let error = run_server_session(&deadline_test_config(), app, &mut io, deadline_test_peer())
+            .await
+            .expect_err("pending coordinator acquire must consume the handshake deadline");
+
+        assert!(matches!(error, WarpLinkError::Timeout(_)));
+        assert_eq!(Instant::now() - start, Duration::from_millis(100));
+        assert_eq!(coordinator.acquire_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(io.send_calls, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn welcome_write_cannot_restart_the_handshake_deadline() {
+        let profile = Arc::new(PushgoWireProfile::new());
+        let app = Arc::new(DeadlineTestApp {
+            profile: Arc::clone(&profile),
+            auth_mode: TestAuthMode::DelayThenAccept(Duration::from_millis(60)),
+            coordinator: None,
+        });
+        let mut io = DeadlineTestIo {
+            hello_frame: Some(test_hello_frame(profile.as_ref())),
+            send_mode: TestSendMode::Pending,
+            send_calls: 0,
+        };
+        let start = Instant::now();
+
+        let error = run_server_session(&deadline_test_config(), app, &mut io, deadline_test_peer())
+            .await
+            .expect_err("pending welcome write must stop at the original deadline");
+
+        assert!(matches!(error, WarpLinkError::Timeout(_)));
+        assert_eq!(Instant::now() - start, Duration::from_millis(100));
+        assert_eq!(io.send_calls, 1);
     }
 
     #[test]
@@ -4122,5 +4458,76 @@ mod tests {
         assert_eq!(required_upgrade_windows(&policy, true), 5);
         assert_eq!(effective_min_dwell_secs(&policy, false), 25);
         assert_eq!(effective_min_dwell_secs(&policy, true), 60);
+    }
+
+    #[test]
+    fn retry_later_never_produces_an_ack_status() {
+        let error = ack_status_for_decision(AppDecision::RetryLater)
+            .expect_err("retry-later must terminate without an ACK");
+        assert!(matches!(error, WarpLinkError::Reconnect(_)));
+    }
+
+    #[test]
+    fn ordinary_goaway_reconnects_with_backoff_while_auth_goaway_is_fatal() {
+        assert!(matches!(
+            classify_primary_goaway("maintenance".to_string()),
+            WarpLinkError::Reconnect(_)
+        ));
+        assert!(matches!(
+            classify_primary_goaway("auth_expired:test".to_string()),
+            WarpLinkError::Auth(_)
+        ));
+        assert!(matches!(
+            classify_primary_goaway("auth_revoked:test".to_string()),
+            WarpLinkError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn welcome_must_select_offered_versions_and_a_bounded_frame_size() {
+        let hello = warp_link_core::HelloCtx {
+            supported_wire_versions: vec![2],
+            supported_payload_versions: vec![1],
+            ..warp_link_core::HelloCtx::default()
+        };
+        let mut welcome = warp_link_core::WelcomeMsg {
+            session_id: "session".to_string(),
+            identity: "device".to_string(),
+            resume_token: None,
+            heartbeat_secs: 30,
+            ping_interval_secs: 15,
+            idle_timeout_secs: 60,
+            max_backoff_secs: 30,
+            auth_expires_at_unix_secs: None,
+            auth_refresh_before_secs: 0,
+            max_frame_bytes: TRANSPORT_MAX_FRAME_BYTES,
+            negotiated_wire_version: 2,
+            negotiated_payload_version: 1,
+            metadata: Default::default(),
+        };
+        validate_welcome_negotiation(&hello, &welcome)
+            .expect("offered versions and bounded frame size should pass");
+
+        welcome.negotiated_wire_version = 9;
+        assert!(matches!(
+            validate_welcome_negotiation(&hello, &welcome),
+            Err(WarpLinkError::Wire(
+                warp_link_core::WireError::VersionIncompatible(_)
+            ))
+        ));
+        welcome.negotiated_wire_version = 2;
+        welcome.negotiated_payload_version = 9;
+        assert!(matches!(
+            validate_welcome_negotiation(&hello, &welcome),
+            Err(WarpLinkError::Wire(
+                warp_link_core::WireError::VersionIncompatible(_)
+            ))
+        ));
+        welcome.negotiated_payload_version = 1;
+        welcome.max_frame_bytes = TRANSPORT_MAX_FRAME_BYTES + 1;
+        assert!(matches!(
+            validate_welcome_negotiation(&hello, &welcome),
+            Err(WarpLinkError::Protocol(_))
+        ));
     }
 }

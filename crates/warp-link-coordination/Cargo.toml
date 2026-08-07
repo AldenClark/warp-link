@@ -2,13 +2,14 @@
 name = "warp-link-coordination"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
-warp-link-core = { path = "../warp-link-core" }
+warp-link-core = { version = "0.1.0", path = "../warp-link-core" }
 
 [dev-dependencies]
 tokio = { workspace = true }

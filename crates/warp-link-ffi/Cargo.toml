@@ -2,6 +2,7 @@
 name = "warp-link-ffi"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -22,6 +23,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 postcard = { workspace = true }
 flume = { workspace = true }
-warp-link = { path = "../warp-link", default-features = false }
-warp-link-core = { path = "../warp-link-core" }
-pushgo-warp-profile = { path = "../pushgo-warp-profile" }
+warp-link = { version = "0.1.0", path = "../warp-link", default-features = false }
+warp-link-core = { version = "0.1.0", path = "../warp-link-core" }
+pushgo-warp-profile = { version = "0.1.0", path = "../pushgo-warp-profile" }

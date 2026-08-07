@@ -2,6 +2,7 @@
 name = "warp-link"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -18,11 +19,12 @@ futures-util = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
-warp-link-core = { path = "../warp-link-core" }
-warp-link-transport = { path = "../warp-link-transport", default-features = false }
+warp-link-core = { version = "0.1.0", path = "../warp-link-core" }
+warp-link-transport = { version = "0.1.0", path = "../warp-link-transport", default-features = false }
 
 [dev-dependencies]
-pushgo-warp-profile = { path = "../pushgo-warp-profile" }
+pushgo-warp-profile = { version = "0.1.0", path = "../pushgo-warp-profile" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 quinn = { workspace = true, features = ["rustls-ring"] }

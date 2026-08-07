@@ -1,0 +1,45 @@
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+skip = [
+    # These older generations are imposed by the current QUIC/WebSocket/TLS
+    # graph. Keep every exception exact so any new duplicate fails the gate.
+    { name = "block-buffer", version = "=0.10.4", reason = "tungstenite sha1 remains on digest 0.10" },
+    { name = "cpufeatures", version = "=0.2.17", reason = "sha1 remains on cpufeatures 0.2" },
+    { name = "crypto-common", version = "=0.1.7", reason = "tungstenite sha1 remains on digest 0.10" },
+    { name = "digest", version = "=0.10.7", reason = "tungstenite sha1 remains on digest 0.10" },
+    { name = "getrandom", version = "=0.2.17", reason = "ring retains getrandom 0.2" },
+    { name = "getrandom", version = "=0.3.4", reason = "tungstenite rand 0.9 retains getrandom 0.3" },
+    { name = "r-efi", version = "=5.3.0", reason = "getrandom 0.3 retains the r-efi 5 ABI" },
+    { name = "rand", version = "=0.9.5", reason = "tungstenite has not migrated to rand 0.10" },
+    { name = "rand_core", version = "=0.9.5", reason = "required by the allowed rand 0.9 generation" },
+    { name = "syn", version = "=2.0.119", reason = "futures and serde macros remain on syn 2" },
+    { name = "webpki-roots", version = "=0.26.11", reason = "tokio-tungstenite exposes the compatibility roots line" },
+    { name = "windows-sys", version = "=0.52.0", reason = "ring retains the Windows 0.52 bindings" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -138,7 +138,7 @@ impl WireProfile for PushgoWireProfile {
 
     fn decode_server_frame(&self, frame: &[u8]) -> Result<DecodedServerFrame, WireError> {
         let (ty, flags, payload) = decode_frame(frame)?;
-        validate_codec(flags)?;
+        validate_wire_flags(flags)?;
         match ty {
             FrameType::ServerWelcome => {
                 let welcome: ServerWelcomeWire =
@@ -215,7 +215,7 @@ impl WireProfile for PushgoWireProfile {
 
     fn decode_client_frame(&self, frame: &[u8]) -> Result<DecodedClientFrame, WireError> {
         let (ty, flags, payload) = decode_frame(frame)?;
-        validate_codec(flags)?;
+        validate_wire_flags(flags)?;
         match ty {
             FrameType::ClientHello => {
                 let hello: ClientHelloWire =
@@ -364,11 +364,17 @@ pub const fn postcard_v1_flags() -> u8 {
     wire_flags(WIRE_CODEC_POSTCARD, WIRE_VERSION_V2)
 }
 
-fn validate_codec(flags: u8) -> Result<(), WireError> {
+fn validate_wire_flags(flags: u8) -> Result<(), WireError> {
     let codec = wire_codec(flags);
     if codec != WIRE_CODEC_POSTCARD {
         return Err(WireError::InvalidFrame(format!(
             "unsupported codec={codec}"
+        )));
+    }
+    let version = wire_version(flags);
+    if version != WIRE_VERSION_V2 {
+        return Err(WireError::VersionIncompatible(format!(
+            "unsupported wire version={version}"
         )));
     }
     Ok(())
@@ -538,6 +544,16 @@ mod tests {
             .decode_server_frame(&frame)
             .expect_err("non postcard codec should be rejected");
         assert!(matches!(error, WireError::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn decode_server_frame_rejects_unsupported_wire_version() {
+        let profile = PushgoWireProfile::new();
+        let frame = vec![FrameType::Ping as u8, wire_flags(WIRE_CODEC_POSTCARD, 9)];
+        let error = profile
+            .decode_server_frame(&frame)
+            .expect_err("unsupported wire version should be rejected");
+        assert!(matches!(error, WireError::VersionIncompatible(_)));
     }
 
     #[test]

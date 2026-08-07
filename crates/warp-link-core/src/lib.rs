@@ -498,6 +498,8 @@ pub enum ProbeRttSource {
 pub enum AppDecision {
     AckOk,
     AckInvalidPayload,
+    /// Do not ACK this delivery and close the active session so the server can redeliver it.
+    RetryLater,
     Ignore,
 }
 
@@ -658,6 +660,8 @@ pub enum WarpLinkError {
     Timeout(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("reconnect required: {0}")]
+    Reconnect(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

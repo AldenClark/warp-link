@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
@@ -13,33 +16,63 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --locked --workspace --all-targets --all-features
 
   feature-matrix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: warp-link no-default-features
-        run: cargo check -p warp-link --no-default-features
+        run: cargo check --locked -p warp-link --no-default-features
       - name: warp-link quic
-        run: cargo check -p warp-link --no-default-features --features quic
+        run: cargo check --locked -p warp-link --no-default-features --features quic
       - name: warp-link tcp
-        run: cargo check -p warp-link --no-default-features --features tcp
+        run: cargo check --locked -p warp-link --no-default-features --features tcp
       - name: warp-link wss
-        run: cargo check -p warp-link --no-default-features --features wss
+        run: cargo check --locked -p warp-link --no-default-features --features wss
       - name: warp-link all
-        run: cargo check -p warp-link --all-features
+        run: cargo check --locked -p warp-link --all-features
       - name: warp-link-ffi no-default-features
-        run: cargo check -p warp-link-ffi --no-default-features
+        run: cargo check --locked -p warp-link-ffi --no-default-features
       - name: warp-link-ffi all
-        run: cargo check -p warp-link-ffi --all-features
+        run: cargo check --locked -p warp-link-ffi --all-features
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enforce dependency, license, and source policy
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo deny check -D warnings advisories bans licenses sources
+
+  ffi-miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Miri toolchain
+        run: >-
+          rustup toolchain install nightly-2026-07-15
+          --profile minimal
+          --component miri
+      - name: Check FFI allocation and lifecycle invariants under Miri
+        run: >-
+          cargo +nightly-2026-07-15 miri test
+          --locked
+          -p warp-link-ffi
+          --no-default-features

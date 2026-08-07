@@ -1,12 +1,14 @@
+use std::cell::Cell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flume::TrySendError;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use pushgo_warp_profile::{PrivatePayloadEnvelope, PushgoWireProfile};
 use serde::Deserialize;
 use tokio::runtime::Runtime;
@@ -21,6 +23,13 @@ const EVENT_QUEUE_CAP: usize = 8192;
 const CALLBACK_QUEUE_CAP_PER_WORKER: usize = 1024;
 const WIRE_VERSION_V2: u8 = 2;
 const PRIVATE_PAYLOAD_VERSION_V1: u8 = 1;
+const WL_ABI_VERSION: u32 = 0x0002_0000;
+const DEFAULT_STOP_TIMEOUT_MS: u32 = 5_000;
+const POLL_OK: i32 = 0;
+const POLL_TIMEOUT: i32 = 1;
+const POLL_STOPPED: i32 = 2;
+const POLL_INVALID_HANDLE: i32 = -1;
+const POLL_INVALID_ARGUMENT: i32 = -2;
 
 #[derive(Debug, Deserialize)]
 struct StartConfig {
@@ -134,33 +143,43 @@ struct QueueApp {
     power_hint: Arc<Mutex<Option<ClientPowerHint>>>,
     event_tx: flume::Sender<String>,
     stats: Arc<SessionStats>,
+    lifecycle: Arc<SessionLifecycle>,
 }
 
 impl QueueApp {
-    fn enqueue_event(&self, payload: String) {
+    fn enqueue_event(&self, payload: String) -> bool {
         self.stats.events_in_total.fetch_add(1, Ordering::Relaxed);
+        if self.lifecycle.is_closing() {
+            self.stats
+                .events_dropped_total
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         match self.event_tx.try_send(payload) {
             Ok(()) => {
                 self.stats
                     .events_enqueued_total
                     .fetch_add(1, Ordering::Relaxed);
+                true
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.stats
                     .events_dropped_total
                     .fetch_add(1, Ordering::Relaxed);
+                false
             }
         }
     }
 
     fn enqueue_callback(&self, event: &str) {
-        if session_callback(self.handle).is_none() {
+        let Some(generation) = self.lifecycle.callback_generation_if_active() else {
             return;
-        }
+        };
 
         let task = CallbackTask {
             handle: self.handle,
             event: event.to_string(),
+            generation,
         };
         let sender = CALLBACK_DISPATCHER.sender_for(self.handle);
         match sender.try_send(task) {
@@ -195,9 +214,13 @@ impl ClientApp for QueueApp {
                     "decode_ok": decode_ok,
                 })
                 .to_string();
-                self.enqueue_callback(serialized.as_str());
-                self.enqueue_event(serialized);
-                if decode_ok {
+                let accepted = self.enqueue_event(serialized.clone());
+                if accepted {
+                    self.enqueue_callback(serialized.as_str());
+                }
+                if !accepted {
+                    AppDecision::RetryLater
+                } else if decode_ok {
                     AppDecision::AckOk
                 } else {
                     AppDecision::AckInvalidPayload
@@ -205,8 +228,9 @@ impl ClientApp for QueueApp {
             }
             other => {
                 let serialized = event_to_json(&other);
-                self.enqueue_callback(serialized.as_str());
-                self.enqueue_event(serialized);
+                if self.enqueue_event(serialized.clone()) {
+                    self.enqueue_callback(serialized.as_str());
+                }
                 AppDecision::Ignore
             }
         }
@@ -218,21 +242,148 @@ impl ClientApp for QueueApp {
 }
 
 struct FfiSession {
-    task: Mutex<tokio::task::JoinHandle<()>>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_tx: watch::Sender<bool>,
-    event_tx: flume::Sender<String>,
+    event_tx: Mutex<Option<flume::Sender<String>>>,
     event_rx: Mutex<flume::Receiver<String>>,
     hello: Arc<Mutex<HelloCtx>>,
     power_hint: Arc<Mutex<Option<ClientPowerHint>>>,
-    callback: Mutex<Option<EventCallback>>,
     last_error: Arc<Mutex<Option<String>>>,
     stats: Arc<SessionStats>,
+    lifecycle: Arc<SessionLifecycle>,
+}
+
+#[derive(Debug, Default)]
+struct SessionLifecycleState {
+    closing: bool,
+    task_finished: bool,
+    callback: Option<EventCallback>,
+    callback_generation: u64,
+    callbacks_in_flight: u64,
+}
+
+#[derive(Debug, Default)]
+struct SessionLifecycle {
+    state: Mutex<SessionLifecycleState>,
+    changed: Condvar,
+}
+
+impl SessionLifecycle {
+    fn is_closing(&self) -> bool {
+        self.state.lock().closing
+    }
+
+    fn callback_generation_if_active(&self) -> Option<u64> {
+        let state = self.state.lock();
+        (!state.closing && state.callback.is_some()).then_some(state.callback_generation)
+    }
+
+    fn begin_callback(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> Option<(EventCallback, CallbackInvocationGuard)> {
+        let mut state = self.state.lock();
+        if state.closing || state.callback_generation != generation {
+            return None;
+        }
+        let callback = state.callback?;
+        state.callbacks_in_flight = state.callbacks_in_flight.saturating_add(1);
+        Some((
+            callback,
+            CallbackInvocationGuard {
+                lifecycle: Arc::clone(self),
+            },
+        ))
+    }
+
+    fn finish_callback(&self) {
+        let mut state = self.state.lock();
+        state.callbacks_in_flight = state.callbacks_in_flight.saturating_sub(1);
+        self.changed.notify_all();
+    }
+
+    fn replace_callback(&self, callback: Option<EventCallback>) -> bool {
+        let mut state = self.state.lock();
+        if state.closing {
+            return false;
+        }
+        state.callback = None;
+        state.callback_generation = state.callback_generation.wrapping_add(1);
+        while state.callbacks_in_flight != 0 {
+            self.changed.wait(&mut state);
+        }
+        if state.closing {
+            return false;
+        }
+        state.callback = callback;
+        true
+    }
+
+    fn begin_close(&self) {
+        let mut state = self.state.lock();
+        state.closing = true;
+        state.callback = None;
+        state.callback_generation = state.callback_generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn wait_callbacks_finished(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while state.callbacks_in_flight != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            self.changed.wait_for(&mut state, deadline - now);
+        }
+        true
+    }
+
+    fn mark_task_finished(&self) {
+        self.state.lock().task_finished = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_task_finished(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        while !state.task_finished {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            self.changed.wait_for(&mut state, deadline - now);
+        }
+        true
+    }
+}
+
+struct CallbackInvocationGuard {
+    lifecycle: Arc<SessionLifecycle>,
+}
+
+impl Drop for CallbackInvocationGuard {
+    fn drop(&mut self) {
+        self.lifecycle.finish_callback();
+    }
+}
+
+struct TaskCompletionGuard {
+    lifecycle: Arc<SessionLifecycle>,
+}
+
+impl Drop for TaskCompletionGuard {
+    fn drop(&mut self) {
+        self.lifecycle.mark_task_finished();
+    }
 }
 
 #[derive(Debug)]
 struct CallbackTask {
     handle: u64,
     event: String,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -295,11 +446,11 @@ fn callback_worker_loop(rx: flume::Receiver<CallbackTask>) {
         let Some(session) = session else {
             continue;
         };
-        let callback = *session.callback.lock();
-        let Some(callback) = callback else {
+        let Some((callback, _guard)) = session.lifecycle.begin_callback(task.generation) else {
             continue;
         };
         let bytes = task.event.into_bytes();
+        let _callback_scope = CurrentCallbackScope::enter(task.handle);
         (callback.callback)(callback.user_data, bytes.as_ptr(), bytes.len() as u32);
 
         session
@@ -307,6 +458,31 @@ fn callback_worker_loop(rx: flume::Receiver<CallbackTask>) {
             .callbacks_invoked
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+thread_local! {
+    static CURRENT_CALLBACK_HANDLE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+struct CurrentCallbackScope {
+    previous: Option<u64>,
+}
+
+impl CurrentCallbackScope {
+    fn enter(handle: u64) -> Self {
+        let previous = CURRENT_CALLBACK_HANDLE.replace(Some(handle));
+        Self { previous }
+    }
+}
+
+impl Drop for CurrentCallbackScope {
+    fn drop(&mut self) {
+        CURRENT_CALLBACK_HANDLE.set(self.previous);
+    }
+}
+
+fn current_callback_handle() -> Option<u64> {
+    CURRENT_CALLBACK_HANDLE.with(Cell::get)
 }
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -324,9 +500,21 @@ fn runtime() -> Result<&'static Runtime, String> {
     }
 }
 
+fn ffi_guard<T>(function: &'static str, fallback: T, operation: impl FnOnce() -> T) -> T {
+    match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                set_last_error(format!("panic contained at FFI boundary: {function}"));
+            }));
+            fallback
+        }
+    }
+}
+
 type EventCallbackFn = extern "C" fn(user_data: u64, ptr: *const u8, len: u32);
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct EventCallback {
     callback: EventCallbackFn,
     user_data: u64,
@@ -338,9 +526,31 @@ pub struct WlBuffer {
     len: u32,
 }
 
+const _: () = {
+    let pointer_size = std::mem::size_of::<*mut u8>();
+    let alignment = std::mem::align_of::<*mut u8>();
+    let unpadded_size = pointer_size + std::mem::size_of::<u32>();
+    let expected_size = unpadded_size.div_ceil(alignment) * alignment;
+    assert!(std::mem::offset_of!(WlBuffer, ptr) == 0);
+    assert!(std::mem::offset_of!(WlBuffer, len) == pointer_size);
+    assert!(std::mem::align_of::<WlBuffer>() == alignment);
+    assert!(std::mem::size_of::<WlBuffer>() == expected_size);
+};
+
+/// Start a warp-link session from a UTF-8 JSON configuration.
+///
+/// # Safety
+///
+/// `config_json` must point to a readable, NUL-terminated byte string that remains valid for the
+/// duration of this call. The string must contain valid UTF-8.
 #[unsafe(no_mangle)]
-pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
-    let Some(raw) = c_str_to_string(config_json) else {
+pub unsafe extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
+    ffi_guard("wl_session_start", 0, || session_start(config_json))
+}
+
+fn session_start(config_json: *const c_char) -> u64 {
+    // SAFETY: forwarded from wl_session_start's caller contract.
+    let Some(raw) = (unsafe { c_str_to_string(config_json) }) else {
         set_last_error("invalid config_json pointer".to_string());
         return 0;
     };
@@ -446,6 +656,7 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
     let hello = Arc::new(Mutex::new(hello));
     let power_hint = Arc::new(Mutex::new(initial_power_hint));
     let stats = Arc::new(SessionStats::new());
+    let lifecycle = Arc::new(SessionLifecycle::default());
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let app = QueueApp {
         handle,
@@ -453,6 +664,7 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
         power_hint: Arc::clone(&power_hint),
         event_tx: event_tx.clone(),
         stats: Arc::clone(&stats),
+        lifecycle: Arc::clone(&lifecycle),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -466,7 +678,13 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
 
     let last_error = Arc::new(Mutex::new(None));
     let task_error = Arc::clone(&last_error);
+    let completion = TaskCompletionGuard {
+        lifecycle: Arc::clone(&lifecycle),
+    };
     let task = runtime.spawn(async move {
+        // The guard is created before spawn and captured by the future, so aborting the task before
+        // its first poll still marks completion when Tokio drops the unpolled future.
+        let _completion = completion;
         if let Err(err) = client_run_with_shutdown(config, app, shutdown_rx).await {
             *task_error.lock() = Some(err.to_string());
             set_last_error(err.to_string());
@@ -476,15 +694,15 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
     SESSIONS.lock().insert(
         handle,
         Arc::new(FfiSession {
-            task: Mutex::new(task),
+            task: Mutex::new(Some(task)),
             shutdown_tx,
-            event_tx,
+            event_tx: Mutex::new(Some(event_tx)),
             event_rx: Mutex::new(event_rx),
             hello,
             power_hint,
-            callback: Mutex::new(None),
             last_error,
             stats,
+            lifecycle,
         }),
     );
     clear_last_error();
@@ -493,59 +711,154 @@ pub extern "C" fn wl_session_start(config_json: *const c_char) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wl_session_poll_event(handle: u64, timeout_ms: u32) -> WlBuffer {
+    ffi_guard("wl_session_poll_event", null_buffer(), || {
+        let (_, buffer) = poll_event(handle, timeout_ms);
+        buffer
+    })
+}
+
+fn poll_event(handle: u64, timeout_ms: u32) -> (i32, WlBuffer) {
     let session = {
         let sessions = SESSIONS.lock();
         sessions.get(&handle).cloned()
     };
     let Some(session) = session else {
         set_last_error(format!("invalid session handle={handle}"));
-        return null_buffer();
+        return (POLL_INVALID_HANDLE, null_buffer());
     };
+    if session.lifecycle.is_closing() {
+        return (POLL_STOPPED, null_buffer());
+    }
 
-    let recv_result = if timeout_ms == 0 {
-        session
+    let recv_result = match timeout_ms {
+        0 => session
+            .event_rx
+            .lock()
+            .try_recv()
+            .map_err(|error| match error {
+                flume::TryRecvError::Empty => flume::RecvTimeoutError::Timeout,
+                flume::TryRecvError::Disconnected => flume::RecvTimeoutError::Disconnected,
+            }),
+        u32::MAX => session
             .event_rx
             .lock()
             .recv()
-            .map_err(|_| flume::RecvTimeoutError::Disconnected)
-    } else {
-        session
+            .map_err(|_| flume::RecvTimeoutError::Disconnected),
+        _ => session
             .event_rx
             .lock()
-            .recv_timeout(Duration::from_millis(timeout_ms as u64))
+            .recv_timeout(Duration::from_millis(u64::from(timeout_ms))),
     };
 
-    let event = match recv_result {
+    let text = match recv_result {
         Ok(text) => {
+            if session.lifecycle.is_closing() {
+                return (POLL_STOPPED, null_buffer());
+            }
             session.stats.poll_returned.fetch_add(1, Ordering::Relaxed);
-            Some(text)
+            text
         }
-        Err(flume::RecvTimeoutError::Timeout) | Err(flume::RecvTimeoutError::Disconnected) => None,
+        Err(flume::RecvTimeoutError::Timeout) => return (POLL_TIMEOUT, null_buffer()),
+        Err(flume::RecvTimeoutError::Disconnected) => return (POLL_STOPPED, null_buffer()),
     };
 
-    let Some(text) = event else {
-        return null_buffer();
-    };
+    (POLL_OK, string_to_buffer(text))
+}
 
-    let mut bytes = text.into_bytes();
-    let len = bytes.len() as u32;
-    let ptr = bytes.as_mut_ptr();
-    std::mem::forget(bytes);
-    WlBuffer { ptr, len }
+/// Poll one event with explicit status reporting.
+///
+/// `timeout_ms == 0` is non-blocking and `timeout_ms == UINT32_MAX` waits indefinitely.
+///
+/// # Safety
+///
+/// `out_buffer` must be non-null, properly aligned, and valid for one `WlBuffer` write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wl_session_poll_event_v2(
+    handle: u64,
+    timeout_ms: u32,
+    out_buffer: *mut WlBuffer,
+) -> i32 {
+    if out_buffer.is_null() {
+        return ffi_guard("wl_session_poll_event_v2", POLL_INVALID_ARGUMENT, || {
+            set_last_error("out_buffer must not be null".to_string());
+            POLL_INVALID_ARGUMENT
+        });
+    }
+    // Initialize the output before any operation that may panic, so caught panics cannot expose an
+    // uninitialized output value to the caller.
+    // SAFETY: the caller contract requires out_buffer to be valid for one WlBuffer write.
+    unsafe { out_buffer.write(null_buffer()) };
+    ffi_guard("wl_session_poll_event_v2", POLL_INVALID_ARGUMENT, || {
+        let (status, buffer) = poll_event(handle, timeout_ms);
+        // SAFETY: checked non-null above and guaranteed writable by the caller contract.
+        unsafe { out_buffer.write(buffer) };
+        status
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wl_session_stop(handle: u64) {
+    ffi_guard("wl_session_stop", (), || {
+        let _ = stop_session(handle, DEFAULT_STOP_TIMEOUT_MS);
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wl_session_stop_v2(handle: u64, timeout_ms: u32) -> bool {
+    ffi_guard("wl_session_stop_v2", false, || {
+        stop_session(handle, timeout_ms.max(1))
+    })
+}
+
+fn stop_session(handle: u64, timeout_ms: u32) -> bool {
+    if let Some(callback_handle) = current_callback_handle() {
+        set_last_error(format!(
+            "session stop cannot run from callback handle={callback_handle} target={handle}"
+        ));
+        return false;
+    }
     let session = {
-        let mut sessions = SESSIONS.lock();
-        sessions.remove(&handle)
+        let sessions = SESSIONS.lock();
+        sessions.get(&handle).cloned()
     };
     let Some(session) = session else {
         set_last_error(format!("invalid session handle={handle}"));
-        return;
+        return false;
     };
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    session.lifecycle.begin_close();
     let _ = session.shutdown_tx.send(true);
-    session.task.lock().abort();
+    // Dropping the final canonical sender wakes all finite and infinite pollers immediately.
+    session.event_tx.lock().take();
+
+    let callbacks_finished = session
+        .lifecycle
+        .wait_callbacks_finished(deadline.saturating_duration_since(Instant::now()));
+    if !session
+        .lifecycle
+        .wait_task_finished(deadline.saturating_duration_since(Instant::now()))
+        && let Some(task) = session.task.lock().as_ref()
+    {
+        task.abort();
+    }
+    let task_finished = session
+        .lifecycle
+        .wait_task_finished(deadline.saturating_duration_since(Instant::now()));
+    if !callbacks_finished || !task_finished {
+        set_last_error(format!("session stop timed out handle={handle}"));
+        return false;
+    }
+    session.task.lock().take();
+    let removed = SESSIONS
+        .lock()
+        .remove(&handle)
+        .is_some_and(|registered| Arc::ptr_eq(&registered, &session));
+    if !removed {
+        set_last_error(format!("session changed while stopping handle={handle}"));
+        return false;
+    }
+    clear_last_error();
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -554,6 +867,18 @@ pub extern "C" fn wl_session_set_event_callback(
     callback: Option<EventCallbackFn>,
     user_data: u64,
 ) -> bool {
+    ffi_guard("wl_session_set_event_callback", false, || {
+        set_event_callback(handle, callback, user_data)
+    })
+}
+
+fn set_event_callback(handle: u64, callback: Option<EventCallbackFn>, user_data: u64) -> bool {
+    if let Some(callback_handle) = current_callback_handle() {
+        set_last_error(format!(
+            "session callback cannot be replaced from callback handle={callback_handle} target={handle}"
+        ));
+        return false;
+    }
     let callback = callback.map(|value| EventCallback {
         callback: value,
         user_data,
@@ -561,12 +886,28 @@ pub extern "C" fn wl_session_set_event_callback(
     set_session_callback(handle, callback)
 }
 
+/// Replace or clear the bearer token used by a running session.
+///
+/// # Safety
+///
+/// `auth_token` may be null. Otherwise it must point to a readable, NUL-terminated byte string
+/// that remains valid for the duration of this call and contains valid UTF-8.
 #[unsafe(no_mangle)]
-pub extern "C" fn wl_session_replace_auth_token(handle: u64, auth_token: *const c_char) -> bool {
+pub unsafe extern "C" fn wl_session_replace_auth_token(
+    handle: u64,
+    auth_token: *const c_char,
+) -> bool {
+    ffi_guard("wl_session_replace_auth_token", false, || {
+        replace_auth_token(handle, auth_token)
+    })
+}
+
+fn replace_auth_token(handle: u64, auth_token: *const c_char) -> bool {
     let token = if auth_token.is_null() {
         None
     } else {
-        let Some(raw) = c_str_to_string(auth_token) else {
+        // SAFETY: forwarded from wl_session_replace_auth_token's caller contract.
+        let Some(raw) = (unsafe { c_str_to_string(auth_token) }) else {
             set_last_error("invalid auth_token pointer".to_string());
             return false;
         };
@@ -591,16 +932,29 @@ pub extern "C" fn wl_session_replace_auth_token(handle: u64, auth_token: *const 
     true
 }
 
+/// Update the session's application-state and optional power-tier hints.
+///
+/// # Safety
+///
+/// Each pointer may be null. Every non-null pointer must reference a readable, NUL-terminated byte
+/// string that remains valid for the duration of this call and contains valid UTF-8.
 #[unsafe(no_mangle)]
-pub extern "C" fn wl_session_set_power_hint(
+pub unsafe extern "C" fn wl_session_set_power_hint(
     handle: u64,
     app_state: *const c_char,
     power_tier: *const c_char,
 ) -> bool {
+    ffi_guard("wl_session_set_power_hint", false, || {
+        set_power_hint(handle, app_state, power_tier)
+    })
+}
+
+fn set_power_hint(handle: u64, app_state: *const c_char, power_tier: *const c_char) -> bool {
     let hint = if app_state.is_null() {
         None
     } else {
-        let Some(state_raw) = c_str_to_string(app_state) else {
+        // SAFETY: forwarded from wl_session_set_power_hint's caller contract.
+        let Some(state_raw) = (unsafe { c_str_to_string(app_state) }) else {
             set_last_error("invalid app_state pointer".to_string());
             return false;
         };
@@ -611,7 +965,8 @@ pub extern "C" fn wl_session_set_power_hint(
         let tier = if power_tier.is_null() {
             None
         } else {
-            let Some(tier_raw) = c_str_to_string(power_tier) else {
+            // SAFETY: forwarded from wl_session_set_power_hint's caller contract.
+            let Some(tier_raw) = (unsafe { c_str_to_string(power_tier) }) else {
                 set_last_error("invalid power_tier pointer".to_string());
                 return false;
             };
@@ -649,6 +1004,12 @@ pub extern "C" fn wl_session_set_power_hint(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn wl_session_stats_json(handle: u64) -> *mut c_char {
+    ffi_guard("wl_session_stats_json", std::ptr::null_mut(), || {
+        session_stats_json(handle)
+    })
+}
+
+fn session_stats_json(handle: u64) -> *mut c_char {
     let session = {
         let sessions = SESSIONS.lock();
         sessions.get(&handle).cloned()
@@ -659,7 +1020,12 @@ pub extern "C" fn wl_session_stats_json(handle: u64) -> *mut c_char {
     };
 
     let stats = &session.stats;
-    let event_queue_len = session.event_tx.len();
+    let event_queue_len = session
+        .event_tx
+        .lock()
+        .as_ref()
+        .map(flume::Sender::len)
+        .unwrap_or_default();
     let callback_queue_pending_shard = CALLBACK_DISPATCHER.pending_len_for_handle(handle);
     let callback_queue_pending_global = CALLBACK_DISPATCHER.pending_len_global();
     let data = serde_json::json!({
@@ -692,26 +1058,50 @@ pub extern "C" fn wl_session_stats_json(handle: u64) -> *mut c_char {
     string_to_c(data.to_string().as_str())
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `ptr`/`len` must come from `wl_session_poll_event` and be freed exactly once.
+/// `ptr` and `len` must be the unchanged pair returned by a successful poll from the same loaded
+/// warp-link library instance. The allocation must still be live and must be returned exactly once.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wl_buffer_free(ptr: *mut u8, len: u32) {
+    ffi_guard("wl_buffer_free", (), || {
+        // SAFETY: forwarded from wl_buffer_free's caller contract.
+        unsafe { buffer_free(ptr, len) };
+    });
+}
+
+/// # Safety
+///
+/// Same allocation-provenance, liveness, length, and single-free requirements as
+/// [`wl_buffer_free`].
+unsafe fn buffer_free(ptr: *mut u8, len: u32) {
     if ptr.is_null() || len == 0 {
         return;
     }
-    // SAFETY: ptr/len came from wl_session_poll_event and are reconstructed exactly once.
+    // SAFETY: ptr/len came from Box<[u8]> in string_to_buffer and are reconstructed once.
     unsafe {
-        let _ = Vec::from_raw_parts(ptr, len as usize, len as usize);
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len as usize);
+        drop(Box::from_raw(slice));
     }
 }
 
 #[unsafe(no_mangle)]
+pub const extern "C" fn wl_abi_version() -> u32 {
+    WL_ABI_VERSION
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn wl_session_last_error(_handle: u64) -> *mut c_char {
-    if _handle != 0 {
+    ffi_guard("wl_session_last_error", std::ptr::null_mut(), || {
+        session_last_error(_handle)
+    })
+}
+
+fn session_last_error(handle: u64) -> *mut c_char {
+    if handle != 0 {
         let session = {
             let sessions = SESSIONS.lock();
-            sessions.get(&_handle).cloned()
+            sessions.get(&handle).cloned()
         };
         if let Some(session) = session
             && let Some(err) = session.last_error.lock().as_ref()
@@ -726,11 +1116,23 @@ pub extern "C" fn wl_session_last_error(_handle: u64) -> *mut c_char {
     }
 }
 
-#[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `ptr` must come from `wl_session_last_error` and be freed exactly once.
+/// `ptr` must be a live pointer returned by `wl_session_last_error` or `wl_session_stats_json` from
+/// the same loaded warp-link library instance. It must be returned exactly once and must not be
+/// accessed after this call.
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn wl_string_free(ptr: *mut c_char) {
+    ffi_guard("wl_string_free", (), || {
+        // SAFETY: forwarded from wl_string_free's caller contract.
+        unsafe { string_free(ptr) };
+    });
+}
+
+/// # Safety
+///
+/// Same allocation-provenance, liveness, and single-free requirements as [`wl_string_free`].
+unsafe fn string_free(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
@@ -740,7 +1142,10 @@ pub unsafe extern "C" fn wl_string_free(ptr: *mut c_char) {
     }
 }
 
-fn c_str_to_string(value: *const c_char) -> Option<String> {
+/// # Safety
+///
+/// `value` must be null or point to a readable NUL-terminated string for the duration of this call.
+unsafe fn c_str_to_string(value: *const c_char) -> Option<String> {
     if value.is_null() {
         return None;
     }
@@ -764,23 +1169,31 @@ fn clear_last_error() {
     *LAST_ERROR.lock() = None;
 }
 
-fn session_callback(handle: u64) -> Option<EventCallback> {
+fn set_session_callback(handle: u64, callback: Option<EventCallback>) -> bool {
     let session = {
         let sessions = SESSIONS.lock();
         sessions.get(&handle).cloned()
-    }?;
-    *session.callback.lock()
-}
-
-fn set_session_callback(handle: u64, callback: Option<EventCallback>) -> bool {
-    let sessions = SESSIONS.lock();
-    let Some(session) = sessions.get(&handle) else {
+    };
+    let Some(session) = session else {
         set_last_error(format!("invalid session handle={handle}"));
         return false;
     };
-    *session.callback.lock() = callback;
+    if !session.lifecycle.replace_callback(callback) {
+        set_last_error(format!("session is stopping handle={handle}"));
+        return false;
+    }
     clear_last_error();
     true
+}
+
+fn string_to_buffer(value: String) -> WlBuffer {
+    let bytes = value.into_bytes().into_boxed_slice();
+    if bytes.is_empty() || bytes.len() > u32::MAX as usize {
+        return null_buffer();
+    }
+    let len = bytes.len() as u32;
+    let ptr = Box::into_raw(bytes).cast::<u8>();
+    WlBuffer { ptr, len }
 }
 
 fn string_to_c(value: &str) -> *mut c_char {
@@ -984,6 +1397,7 @@ fn decode_payload_map(bytes: &[u8]) -> (serde_json::Value, bool) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{Barrier, mpsc};
 
     use super::*;
 
@@ -1046,5 +1460,220 @@ mod tests {
         let (decoded_invalid, ok_invalid) = decode_payload_map(b"not-postcard");
         assert!(!ok_invalid);
         assert_eq!(decoded_invalid, serde_json::json!({}));
+    }
+
+    extern "C" fn noop_callback(_user_data: u64, _ptr: *const u8, _len: u32) {}
+
+    fn install_test_session() -> u64 {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        let completion = TaskCompletionGuard {
+            lifecycle: Arc::clone(&lifecycle),
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (event_tx, event_rx) = flume::bounded(1);
+        let task = runtime()
+            .expect("test runtime should initialize")
+            .spawn(async move {
+                let _completion = completion;
+                while !*shutdown_rx.borrow() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            });
+        let session = Arc::new(FfiSession {
+            task: Mutex::new(Some(task)),
+            shutdown_tx,
+            event_tx: Mutex::new(Some(event_tx)),
+            event_rx: Mutex::new(event_rx),
+            hello: Arc::new(Mutex::new(HelloCtx::default())),
+            power_hint: Arc::new(Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(None)),
+            stats: Arc::new(SessionStats::new()),
+            lifecycle,
+        });
+        assert!(SESSIONS.lock().insert(handle, session).is_none());
+        handle
+    }
+
+    #[test]
+    fn boxed_slice_buffer_round_trips_when_string_capacity_exceeds_length() {
+        let mut value = String::with_capacity(4096);
+        value.push_str("event");
+        assert!(value.capacity() > value.len());
+
+        let buffer = string_to_buffer(value);
+        assert!(!buffer.ptr.is_null());
+        assert_eq!(buffer.len, 5);
+        // SAFETY: buffer was returned by string_to_buffer and is freed exactly once here.
+        unsafe { wl_buffer_free(buffer.ptr, buffer.len) };
+    }
+
+    #[test]
+    fn dropping_an_unpolled_task_future_marks_completion() {
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        let completion = TaskCompletionGuard {
+            lifecycle: Arc::clone(&lifecycle),
+        };
+        let unpolled = async move {
+            let _completion = completion;
+            std::future::pending::<()>().await;
+        };
+
+        drop(unpolled);
+        assert!(lifecycle.wait_task_finished(Duration::ZERO));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Tokio runtime requires unsupported OS I/O under Miri")]
+    fn legacy_zero_timeout_is_nonblocking() {
+        let handle = install_test_session();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let buffer = wl_session_poll_event(handle, 0);
+            done_tx
+                .send((buffer.ptr as usize, buffer.len))
+                .expect("poll result receiver should remain");
+        });
+
+        let result = done_rx.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            assert!(wl_session_stop_v2(handle, 1_000));
+            worker.join().expect("poll worker should exit after stop");
+            panic!("zero-timeout legacy poll blocked");
+        }
+        assert_eq!(result.expect("checked above"), (0, 0));
+        worker.join().expect("poll worker should not panic");
+        assert!(wl_session_stop_v2(handle, 1_000));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Tokio runtime requires unsupported OS I/O under Miri")]
+    fn stop_wakes_legacy_infinite_poll() {
+        let handle = install_test_session();
+        let started = Arc::new(Barrier::new(2));
+        let worker_started = Arc::clone(&started);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_started.wait();
+            let buffer = wl_session_poll_event(handle, u32::MAX);
+            done_tx
+                .send((buffer.ptr as usize, buffer.len))
+                .expect("poll result receiver should remain");
+        });
+
+        started.wait();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "infinite poll must remain blocked before stop"
+        );
+        assert!(wl_session_stop_v2(handle, 1_000));
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stop must wake the blocked poll"),
+            (0, 0)
+        );
+        worker.join().expect("poll worker should not panic");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Tokio runtime requires unsupported OS I/O under Miri")]
+    fn timed_stop_is_retriable_after_an_in_flight_callback_exits() {
+        let handle = install_test_session();
+        let session = SESSIONS
+            .lock()
+            .get(&handle)
+            .cloned()
+            .expect("test session should be registered");
+        assert!(session.lifecycle.replace_callback(Some(EventCallback {
+            callback: noop_callback,
+            user_data: 9,
+        })));
+        let generation = session
+            .lifecycle
+            .callback_generation_if_active()
+            .expect("callback should be active");
+        let (_, in_flight) = session
+            .lifecycle
+            .begin_callback(generation)
+            .expect("callback invocation should begin");
+
+        assert!(
+            !wl_session_stop_v2(handle, 10),
+            "stop must report that callback quiescence missed its deadline"
+        );
+        assert!(session.lifecycle.is_closing());
+        drop(in_flight);
+        assert!(
+            wl_session_stop_v2(handle, 1_000),
+            "stop should be retriable after the callback exits"
+        );
+    }
+
+    #[test]
+    fn callback_replacement_waits_for_in_flight_callback() {
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        assert!(lifecycle.replace_callback(Some(EventCallback {
+            callback: noop_callback,
+            user_data: 7,
+        })));
+        let generation = lifecycle
+            .callback_generation_if_active()
+            .expect("callback generation should be active");
+        let (_, in_flight) = lifecycle
+            .begin_callback(generation)
+            .expect("callback should begin");
+        let replacement_lifecycle = Arc::clone(&lifecycle);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let replaced = replacement_lifecycle.replace_callback(None);
+            done_tx
+                .send(replaced)
+                .expect("result receiver should remain");
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "replacement must wait while callback is in flight"
+        );
+        drop(in_flight);
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("replacement should complete after callback exits")
+        );
+        worker.join().expect("replacement worker should not panic");
+    }
+
+    #[test]
+    fn full_event_queue_requests_retry_instead_of_ack() {
+        let (event_tx, _event_rx) = flume::bounded(1);
+        let lifecycle = Arc::new(SessionLifecycle::default());
+        let app = QueueApp {
+            handle: u64::MAX,
+            hello: Arc::new(Mutex::new(HelloCtx::default())),
+            power_hint: Arc::new(Mutex::new(None)),
+            event_tx,
+            stats: Arc::new(SessionStats::new()),
+            lifecycle,
+        };
+        let payload = postcard::to_allocvec(&PrivatePayloadEnvelope {
+            payload_version: PRIVATE_PAYLOAD_VERSION_V1,
+            data: HashMap::new(),
+        })
+        .expect("payload should encode");
+        let message = |seq| ClientEvent::Message {
+            transport: warp_link_core::TransportKind::Tcp,
+            msg: warp_link_core::DeliverMsg {
+                seq: Some(seq),
+                id: format!("delivery-{seq}"),
+                payload: payload.clone().into(),
+            },
+        };
+
+        assert_eq!(app.on_event(message(1)), AppDecision::AckOk);
+        assert_eq!(app.on_event(message(2)), AppDecision::RetryLater);
     }
 }

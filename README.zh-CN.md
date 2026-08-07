@@ -39,14 +39,16 @@
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo check -p warp-link --no-default-features
-cargo check -p warp-link --no-default-features --features quic
-cargo check -p warp-link --no-default-features --features tcp
-cargo check -p warp-link --no-default-features --features wss
-cargo check -p warp-link-ffi --no-default-features
-cargo check -p warp-link-ffi --all-features
-cargo audit # 需先安装：cargo install cargo-audit
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
+cargo check --locked -p warp-link --no-default-features
+cargo check --locked -p warp-link --no-default-features --features quic
+cargo check --locked -p warp-link --no-default-features --features tcp
+cargo check --locked -p warp-link --no-default-features --features wss
+cargo check --locked -p warp-link-ffi --no-default-features
+cargo check --locked -p warp-link-ffi --all-features
+cargo audit --deny warnings # 需先安装：cargo install --locked cargo-audit
+cargo deny check -D warnings advisories bans licenses sources # cargo-deny 0.20.2
 ```
 
 ## 文档
