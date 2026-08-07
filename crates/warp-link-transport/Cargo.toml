@@ -14,14 +14,21 @@ wss = []
 [dependencies]
 bytes = { workspace = true }
 futures-util = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
 warp-link-core = { path = "../warp-link-core" }
 webpki-roots = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+quinn = { workspace = true, features = ["rustls-ring"] }
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }

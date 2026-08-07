@@ -139,10 +139,7 @@ fn preferred_transport_active(policy: &PolicyInput) -> Option<TransportKind> {
 }
 
 fn transport_disabled_by_policy(policy: &PolicyInput, transport: TransportKind) -> bool {
-    policy
-        .disabled_transports
-        .iter()
-        .any(|disabled| *disabled == transport)
+    policy.disabled_transports.contains(&transport)
 }
 
 fn default_transport_order() -> Vec<TransportKind> {
@@ -268,7 +265,7 @@ fn build_transport_plan(config: &ClientConfig, policy: &PolicyInput) -> Transpor
             suppressed.push(transport);
             continue;
         }
-        let delay_ms = if preferred.is_some() && !preferred_is_primary && allowed.len() > 0 {
+        let delay_ms = if preferred.is_some() && !preferred_is_primary && !allowed.is_empty() {
             preferred_transport_delay_ms(config, transport, allowed.len() - 1)
         } else {
             transport_start_delay_ms(config, transport, allowed.len())
@@ -944,10 +941,12 @@ async fn run_client_session_once(
                         && let Some(candidate_welcome) = commit_candidate_cutover(
                             config,
                             Arc::clone(&app),
-                            continuity,
-                            &mut power_runtime,
-                            &mut transport,
-                            &mut io,
+                            ActiveTransport {
+                                continuity,
+                                power_runtime: &mut power_runtime,
+                                transport: &mut transport,
+                                io: &mut io,
+                            },
                             target,
                             candidate_io,
                             decision_id_seq,
@@ -1049,10 +1048,12 @@ async fn run_client_session_once(
                             && let Some(candidate_welcome) = commit_candidate_cutover(
                                 config,
                                 Arc::clone(&app),
-                                continuity,
-                                &mut power_runtime,
-                                &mut transport,
-                                &mut io,
+                                ActiveTransport {
+                                    continuity,
+                                    power_runtime: &mut power_runtime,
+                                    transport: &mut transport,
+                                    io: &mut io,
+                                },
                                 target,
                                 candidate_io,
                                 decision_id_seq,
@@ -1172,10 +1173,12 @@ async fn run_client_session_once(
                                         commit_candidate_cutover(
                                             config,
                                             Arc::clone(&app),
-                                            continuity,
-                                            &mut power_runtime,
-                                            &mut transport,
-                                            &mut io,
+                                            ActiveTransport {
+                                                continuity,
+                                                power_runtime: &mut power_runtime,
+                                                transport: &mut transport,
+                                                io: &mut io,
+                                            },
                                             target,
                                             candidate_io,
                                             decision_id_seq,
@@ -1301,10 +1304,12 @@ async fn run_client_session_once(
                                     && let Some(candidate_welcome) = commit_candidate_cutover(
                                         config,
                                         Arc::clone(&app),
-                                        continuity,
-                                        &mut power_runtime,
-                                        &mut transport,
-                                        &mut io,
+                                        ActiveTransport {
+                                            continuity,
+                                            power_runtime: &mut power_runtime,
+                                            transport: &mut transport,
+                                            io: &mut io,
+                                        },
                                         target,
                                         candidate_io,
                                         decision_id_seq,
@@ -1373,16 +1378,18 @@ async fn run_client_session_once(
 
         let control = handle_primary_frame(
             config,
-            app.as_ref(),
-            continuity,
-            &mut power_runtime,
-            &mut io,
+            Arc::clone(&app),
             transport,
             frame,
-            &mut pending_ping_sent_at,
-            &mut pending_ping_source,
-            &mut health_tracker,
-            &mut mobility_tracker,
+            PrimaryFrameState {
+                continuity,
+                power_runtime: &mut power_runtime,
+                io: &mut io,
+                pending_ping_sent_at: &mut pending_ping_sent_at,
+                pending_ping_source: &mut pending_ping_source,
+                health_tracker: &mut health_tracker,
+                mobility_tracker: &mut mobility_tracker,
+            },
         )
         .await?;
         if matches!(control, FrameLoopControl::TerminateOk) {
@@ -1396,27 +1403,53 @@ enum FrameLoopControl {
     TerminateOk,
 }
 
+struct PrimaryFrameState<'a> {
+    continuity: &'a mut ClientContinuityState,
+    power_runtime: &'a mut ClientPowerRuntime,
+    io: &'a mut ClientIo,
+    pending_ping_sent_at: &'a mut Option<Instant>,
+    pending_ping_source: &'a mut Option<ProbeRttSource>,
+    health_tracker: &'a mut HealthTracker,
+    mobility_tracker: &'a mut MobilityTracker,
+}
+
+async fn dispatch_blocking_client_event(
+    app: Arc<dyn ClientApp>,
+    event: ClientEvent,
+) -> Result<AppDecision, WarpLinkError> {
+    tokio::task::spawn_blocking(move || app.on_event(event))
+        .await
+        .map_err(|error| WarpLinkError::Internal(format!("client event callback failed: {error}")))
+}
+
 async fn handle_primary_frame(
     config: &ClientConfig,
-    app: &dyn ClientApp,
-    continuity: &mut ClientContinuityState,
-    power_runtime: &mut ClientPowerRuntime,
-    io: &mut ClientIo,
+    app: Arc<dyn ClientApp>,
     transport: TransportKind,
     frame: Vec<u8>,
-    pending_ping_sent_at: &mut Option<Instant>,
-    pending_ping_source: &mut Option<ProbeRttSource>,
-    health_tracker: &mut HealthTracker,
-    mobility_tracker: &mut MobilityTracker,
+    state: PrimaryFrameState<'_>,
 ) -> Result<FrameLoopControl, WarpLinkError> {
+    let PrimaryFrameState {
+        continuity,
+        power_runtime,
+        io,
+        pending_ping_sent_at,
+        pending_ping_source,
+        health_tracker,
+        mobility_tracker,
+    } = state;
     match config.wire_profile.decode_server_frame(&frame)? {
         DecodedServerFrame::Deliver(msg) => {
             power_runtime.note_message(&config.policy.power, Instant::now());
             health_tracker.note_frame_progress(Instant::now());
-            let decision = app.on_event(ClientEvent::Message {
-                transport,
-                msg: msg.clone(),
-            });
+            let decision = dispatch_blocking_client_event(
+                Arc::clone(&app),
+                ClientEvent::Message {
+                    transport,
+                    msg: msg.clone(),
+                },
+            )
+            .await?;
             let status = match decision {
                 AppDecision::AckOk => Some(AckStatus::Ok),
                 AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
@@ -1488,17 +1521,27 @@ async fn handle_primary_frame(
     }
 }
 
+struct ActiveTransport<'a> {
+    continuity: &'a mut ClientContinuityState,
+    power_runtime: &'a mut ClientPowerRuntime,
+    transport: &'a mut TransportKind,
+    io: &'a mut ClientIo,
+}
+
 async fn commit_candidate_cutover(
     config: &ClientConfig,
     app: Arc<dyn ClientApp>,
-    continuity: &mut ClientContinuityState,
-    power_runtime: &mut ClientPowerRuntime,
-    transport: &mut TransportKind,
-    io: &mut ClientIo,
+    active: ActiveTransport<'_>,
     target: TransportKind,
     mut candidate_io: ClientIo,
     decision_id: u64,
 ) -> Result<Option<warp_link_core::WelcomeMsg>, WarpLinkError> {
+    let ActiveTransport {
+        continuity,
+        power_runtime,
+        transport,
+        io,
+    } = active;
     let from_transport = *transport;
     emit_scheduler_state(
         app.as_ref(),
@@ -1553,7 +1596,7 @@ async fn commit_candidate_cutover(
         decision_id,
     });
 
-    if let Err(err) = cutover_guard(config, app.as_ref(), continuity, io, target).await {
+    if let Err(err) = cutover_guard(config, Arc::clone(&app), continuity, io, target).await {
         let _ = app.on_event(ClientEvent::CutoverRollback {
             restored: from_transport,
             failed: target,
@@ -1581,7 +1624,7 @@ async fn commit_candidate_cutover(
 
 async fn cutover_guard(
     config: &ClientConfig,
-    app: &dyn ClientApp,
+    app: Arc<dyn ClientApp>,
     continuity: &mut ClientContinuityState,
     io: &mut ClientIo,
     transport: TransportKind,
@@ -1594,10 +1637,14 @@ async fn cutover_guard(
     let frame = io.recv_frame(config.policy.cutover_guard_ms).await?;
     match config.wire_profile.decode_server_frame(&frame)? {
         DecodedServerFrame::Deliver(msg) => {
-            let decision = app.on_event(ClientEvent::Message {
-                transport,
-                msg: msg.clone(),
-            });
+            let decision = dispatch_blocking_client_event(
+                app,
+                ClientEvent::Message {
+                    transport,
+                    msg: msg.clone(),
+                },
+            )
+            .await?;
             let status = match decision {
                 AppDecision::AckOk => Some(AckStatus::Ok),
                 AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
@@ -1664,10 +1711,18 @@ fn spawn_old_primary_drain(
             };
             match decoded {
                 DecodedServerFrame::Deliver(msg) => {
-                    let decision = app.on_event(ClientEvent::Message {
-                        transport,
-                        msg: msg.clone(),
-                    });
+                    let decision = match dispatch_blocking_client_event(
+                        Arc::clone(&app),
+                        ClientEvent::Message {
+                            transport,
+                            msg: msg.clone(),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(decision) => decision,
+                        Err(_) => break,
+                    };
                     let status = match decision {
                         AppDecision::AckOk => Some(AckStatus::Ok),
                         AppDecision::AckInvalidPayload => Some(AckStatus::InvalidPayload),
@@ -3999,9 +4054,11 @@ mod tests {
 
     #[test]
     fn migration_cooldown_blocks_when_limit_hit_and_recovers_after_window() {
-        let mut policy = warp_link_core::ClientPolicy::default();
-        policy.scheduler_max_migrations_per_5m = 2;
-        policy.scheduler_cooldown_secs = 90;
+        let policy = warp_link_core::ClientPolicy {
+            scheduler_max_migrations_per_5m: 2,
+            scheduler_cooldown_secs: 90,
+            ..warp_link_core::ClientPolicy::default()
+        };
         let now = Instant::now();
         let mut history = VecDeque::from(vec![
             now - Duration::from_secs(10),
@@ -4053,11 +4110,13 @@ mod tests {
 
     #[test]
     fn mobility_mode_uses_stricter_upgrade_windows_and_dwell() {
-        let mut policy = warp_link_core::ClientPolicy::default();
-        policy.scheduler_upgrade_confirm_windows = 3;
-        policy.mobility_upgrade_confirm_windows = 5;
-        policy.upgrade_probe_min_dwell_secs = 25;
-        policy.mobility_min_dwell_secs = 60;
+        let policy = warp_link_core::ClientPolicy {
+            scheduler_upgrade_confirm_windows: 3,
+            mobility_upgrade_confirm_windows: 5,
+            upgrade_probe_min_dwell_secs: 25,
+            mobility_min_dwell_secs: 60,
+            ..warp_link_core::ClientPolicy::default()
+        };
 
         assert_eq!(required_upgrade_windows(&policy, false), 3);
         assert_eq!(required_upgrade_windows(&policy, true), 5);

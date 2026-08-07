@@ -15,14 +15,21 @@ wss = ["warp-link-transport/wss"]
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
-quinn = { workspace = true }
 rand = { workspace = true }
-rustls = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 warp-link-core = { path = "../warp-link-core" }
 warp-link-transport = { path = "../warp-link-transport", default-features = false }
 
 [dev-dependencies]
 pushgo-warp-profile = { path = "../pushgo-warp-profile" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+quinn = { workspace = true, features = ["rustls-ring"] }
+rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = { workspace = true, features = ["ring"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
+rustls = { workspace = true, features = ["aws_lc_rs"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
