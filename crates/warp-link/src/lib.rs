@@ -3817,10 +3817,13 @@ where
                     return Ok(data.to_vec());
                 }
                 WsMessage::Ping(payload) => {
-                    self.ws
-                        .send(WsMessage::Pong(payload))
-                        .await
-                        .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
+                    timeout(
+                        Duration::from_millis(timeout_ms),
+                        self.ws.send(WsMessage::Pong(payload)),
+                    )
+                    .await
+                    .map_err(|_| WarpLinkError::Transport("wss pong write timeout".to_string()))?
+                    .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
                 }
                 WsMessage::Pong(_) => {}
                 WsMessage::Close(_) => {
@@ -4529,5 +4532,93 @@ mod tests {
             validate_welcome_negotiation(&hello, &welcome),
             Err(WarpLinkError::Protocol(_))
         ));
+    }
+
+    #[cfg(feature = "wss")]
+    #[tokio::test]
+    async fn wss_server_ping_pong_backpressure_obeys_read_timeout() {
+        use super::{TungsteniteWsIo, WsUpgradeIo};
+        use futures_util::SinkExt;
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+        use tokio_tungstenite::WebSocketStream;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut server = TungsteniteWsIo {
+            ws: server,
+            remote_addr: None,
+            max_frame_bytes: TRANSPORT_MAX_FRAME_BYTES as usize,
+        };
+        let mut recv = tokio::spawn(async move { server.recv_binary(80).await });
+
+        timeout(
+            Duration::from_secs(1),
+            client.send(Message::Ping(vec![7; 125].into())),
+        )
+        .await
+        .expect("peer should send Ping")
+        .expect("Ping should encode");
+        let mut first_pong_byte = [0];
+        timeout(
+            Duration::from_secs(1),
+            client.get_mut().read_exact(&mut first_pong_byte),
+        )
+        .await
+        .expect("server should begin sending Pong")
+        .expect("Pong byte should be readable");
+
+        let result = timeout(Duration::from_millis(300), &mut recv).await;
+        recv.abort();
+        match result {
+            Ok(Ok(Err(WarpLinkError::Transport(reason)))) => {
+                assert_eq!(reason, "wss pong write timeout");
+            }
+            other => panic!("blocked Pong must terminate the server session: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "wss")]
+    #[tokio::test]
+    async fn wss_server_ping_pong_preserves_next_binary_frame() {
+        use super::{TungsteniteWsIo, WsUpgradeIo};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::time::timeout;
+        use tokio_tungstenite::WebSocketStream;
+        use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut server = TungsteniteWsIo {
+            ws: server,
+            remote_addr: None,
+            max_frame_bytes: TRANSPORT_MAX_FRAME_BYTES as usize,
+        };
+        let peer = tokio::spawn(async move {
+            client
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .expect("Ping should send");
+            let reply = timeout(Duration::from_secs(1), client.next())
+                .await
+                .expect("Pong should arrive")
+                .expect("peer should remain open")
+                .expect("Pong should decode");
+            assert!(matches!(reply, Message::Pong(_)));
+            client
+                .send(Message::Binary(vec![4, 5, 6].into()))
+                .await
+                .expect("binary frame should send");
+        });
+
+        let frame = timeout(Duration::from_secs(2), server.recv_binary(500))
+            .await
+            .expect("server should receive next binary frame")
+            .expect("binary frame should decode");
+        assert_eq!(frame, [4, 5, 6]);
+        peer.await.expect("peer task should finish");
     }
 }
