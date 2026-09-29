@@ -27,13 +27,18 @@ typedef void (*WlEventCallback)(uint64_t user_data, const uint8_t *ptr, uint32_t
 uint32_t wl_abi_version(void);
 uint64_t wl_session_start(const char *config_json);
 
-/* timeout_ms == 0 is non-blocking and WL_POLL_INFINITE waits indefinitely. */
+/*
+ * Polling is the primary event-consumption path. The host must keep draining
+ * this queue while the session runs, including when a callback is registered.
+ * Registering a callback does not switch the session to callback-only delivery.
+ * timeout_ms == 0 is non-blocking and WL_POLL_INFINITE waits indefinitely.
+ */
 WlBuffer wl_session_poll_event(uint64_t handle, uint32_t timeout_ms);
 
 /*
- * Explicit API: timeout_ms == 0 is non-blocking and WL_POLL_INFINITE waits
- * indefinitely. On every return, out_buffer is initialized; a non-OK result
- * returns {NULL, 0}.
+ * Explicit polling API with the same consumption requirement as above.
+ * timeout_ms == 0 is non-blocking and WL_POLL_INFINITE waits indefinitely.
+ * On every return, out_buffer is initialized; a non-OK result returns {NULL, 0}.
  */
 int32_t wl_session_poll_event_v2(
     uint64_t handle,
@@ -53,6 +58,8 @@ void wl_session_stop(uint64_t handle);
 bool wl_session_stop_v2(uint64_t handle, uint32_t timeout_ms);
 
 /*
+ * Callbacks are best-effort auxiliary notifications. A callback may be dropped
+ * when its queue is full and cannot replace continuous event polling.
  * Replacing or clearing a callback is quiescent: after this function returns,
  * the previous callback and user_data are no longer in use. Do not call this
  * function or either stop function from inside any warp-link callback.

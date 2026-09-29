@@ -22,6 +22,10 @@
 - `warp-link-ffi`：给非 Rust 运行时使用的 C ABI
 - `pushgo-warp-profile`：PushGo 线协议 profile 插件
 
+## FFI 事件消费
+
+会话运行期间，宿主必须持续调用 `wl_session_poll_event` 或 `wl_session_poll_event_v2` 排空事件队列。轮询队列是主要的事件消费路径。注册 `wl_session_set_event_callback` 不会切换为仅回调投递：回调只是尽力提供的辅助通知，回调队列满时可能丢弃。仅使用回调的宿主最终会填满轮询队列，使消息投递停滞。
+
 ## 工具链
 
 - Rust `stable`
