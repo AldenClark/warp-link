@@ -22,6 +22,10 @@ If you are evaluating this for non-PushGo production workloads, treat it as earl
 - `warp-link-ffi`: C ABI for non-Rust runtimes
 - `pushgo-warp-profile`: PushGo wire profile plugin
 
+## FFI Event Consumption
+
+The host must continuously drain `wl_session_poll_event` or `wl_session_poll_event_v2` while a session runs. This poll queue is the primary event-consumption path. Registering `wl_session_set_event_callback` does not switch the session to callback-only delivery: callbacks are best-effort auxiliary notifications and may be dropped when their queue is full. A callback-only host will eventually fill the poll queue and stall message delivery.
+
 ## Toolchain
 
 - `stable` Rust toolchain

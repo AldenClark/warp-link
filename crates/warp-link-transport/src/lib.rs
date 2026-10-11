@@ -184,39 +184,52 @@ impl ClientIo {
                     .await
                     .map_err(|_| WarpLinkError::Timeout("tcp read timeout".to_string()))?
             }
-            ClientIo::Wss { stream } => loop {
-                let next = timeout(Duration::from_millis(idle_timeout_ms), stream.next())
-                    .await
-                    .map_err(|_| WarpLinkError::Timeout("wss read timeout".to_string()))?;
-                match next {
-                    Some(Ok(Message::Binary(frame))) => {
-                        if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
-                            return Err(WarpLinkError::Protocol(format!(
-                                "invalid stream frame length {}",
-                                frame.len()
-                            )));
-                        }
-                        return Ok(frame.to_vec());
-                    }
-                    Some(Ok(Message::Text(_))) => {
-                        return Err(WarpLinkError::Protocol(
-                            "wss text frame is not supported".to_string(),
-                        ));
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        return Err(WarpLinkError::Transport("wss closed".to_string()));
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        stream
-                            .send(Message::Pong(payload))
-                            .await
-                            .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
-                    }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
-                    Some(Err(err)) => return Err(WarpLinkError::Transport(err.to_string())),
-                    None => return Err(WarpLinkError::Transport("wss closed".to_string())),
+            ClientIo::Wss { stream } => recv_wss_frame(stream.as_mut(), idle_timeout_ms).await,
+        }
+    }
+}
+
+async fn recv_wss_frame<S>(
+    stream: &mut WebSocketStream<S>,
+    idle_timeout_ms: u64,
+) -> Result<Vec<u8>, WarpLinkError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let next = timeout(Duration::from_millis(idle_timeout_ms), stream.next())
+            .await
+            .map_err(|_| WarpLinkError::Timeout("wss read timeout".to_string()))?;
+        match next {
+            Some(Ok(Message::Binary(frame))) => {
+                if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
+                    return Err(WarpLinkError::Protocol(format!(
+                        "invalid stream frame length {}",
+                        frame.len()
+                    )));
                 }
-            },
+                return Ok(frame.to_vec());
+            }
+            Some(Ok(Message::Text(_))) => {
+                return Err(WarpLinkError::Protocol(
+                    "wss text frame is not supported".to_string(),
+                ));
+            }
+            Some(Ok(Message::Close(_))) => {
+                return Err(WarpLinkError::Transport("wss closed".to_string()));
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                timeout(
+                    Duration::from_millis(idle_timeout_ms),
+                    stream.send(Message::Pong(payload)),
+                )
+                .await
+                .map_err(|_| WarpLinkError::Transport("wss pong write timeout".to_string()))?
+                .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
+            }
+            Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+            Some(Err(err)) => return Err(WarpLinkError::Transport(err.to_string())),
+            None => return Err(WarpLinkError::Transport("wss closed".to_string())),
         }
     }
 }
@@ -717,6 +730,75 @@ mod tests {
             .await
             .expect_err("oversized frame should be rejected");
         assert!(matches!(error, WarpLinkError::Protocol(_)));
+    }
+
+    #[tokio::test]
+    async fn wss_ping_pong_backpressure_obeys_read_timeout() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let mut recv = tokio::spawn(async move { recv_wss_frame(&mut client, 80).await });
+
+        // The Pong is a masked client frame larger than the 64-byte duplex buffer.
+        // Stop reading after one byte to prove the reply started but cannot flush.
+        timeout(
+            Duration::from_secs(1),
+            server.send(Message::Ping(vec![7; 125].into())),
+        )
+        .await
+        .expect("peer should send Ping")
+        .expect("Ping should encode");
+        let mut first_pong_byte = [0];
+        timeout(
+            Duration::from_secs(1),
+            server.get_mut().read_exact(&mut first_pong_byte),
+        )
+        .await
+        .expect("client should begin sending Pong")
+        .expect("Pong byte should be readable");
+
+        let result = timeout(Duration::from_millis(300), &mut recv).await;
+        recv.abort();
+        match result {
+            Ok(Ok(Err(WarpLinkError::Transport(reason)))) => {
+                assert_eq!(reason, "wss pong write timeout");
+            }
+            other => panic!("blocked Pong must terminate the client connection: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wss_ping_pong_preserves_next_binary_frame() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let peer = tokio::spawn(async move {
+            server
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .expect("Ping should send");
+            let reply = timeout(Duration::from_secs(1), server.next())
+                .await
+                .expect("Pong should arrive")
+                .expect("peer should remain open")
+                .expect("Pong should decode");
+            assert!(matches!(reply, Message::Pong(_)));
+            server
+                .send(Message::Binary(vec![4, 5, 6].into()))
+                .await
+                .expect("binary frame should send");
+        });
+
+        let frame = timeout(Duration::from_secs(2), recv_wss_frame(&mut client, 500))
+            .await
+            .expect("client should receive next binary frame")
+            .expect("binary frame should decode");
+        assert_eq!(frame, [4, 5, 6]);
+        peer.await.expect("peer task should finish");
     }
 
     #[test]
