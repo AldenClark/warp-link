@@ -815,7 +815,7 @@ async fn run_client_session_once(
     let hello_frame = config.wire_profile.encode_client_hello(&hello)?;
     io.send_frame(&hello_frame, config.policy.write_timeout_ms)
         .await?;
-    let mut inband_hello_snapshot = hello;
+    let inband_hello_snapshot = hello;
     let mut last_policy = initial_policy.clone();
     let welcome = loop {
         let first = match await_value_or_control_change(
@@ -887,9 +887,9 @@ async fn run_client_session_once(
     });
     continuity.note_welcome(welcome.resume_token.as_deref());
 
-    let mut idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
-    let mut idle_timeout_streak = 0u8;
-    let mut last_idle_ping_at = Instant::now();
+    let idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
+    let idle_timeout_streak = 0u8;
+    let last_idle_ping_at = Instant::now();
     let mut pending_ping_sent_at: Option<Instant> = None;
     let mut pending_ping_source: Option<ProbeRttSource> = None;
     let mut health_tracker = HealthTracker::new(Instant::now());
@@ -907,12 +907,20 @@ async fn run_client_session_once(
         mobility_mode,
     );
 
+    let mut maintenance = SessionMaintenance {
+        idle_timeout_ms,
+        idle_timeout_streak,
+        last_idle_ping_at,
+        inband_hello_snapshot,
+        upgrade_probe_runtime,
+    };
+
     loop {
         maybe_send_inband_hello_update(
             config,
             app.as_ref(),
             &mut io,
-            &mut inband_hello_snapshot,
+            &mut maintenance.inband_hello_snapshot,
             &mut power_runtime,
             continuity,
         )
@@ -974,22 +982,17 @@ async fn run_client_session_once(
                         )
                         .await?
                     {
-                        continuity.note_welcome(candidate_welcome.resume_token.as_deref());
-                        idle_timeout_ms =
-                            u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
-                        idle_timeout_streak = 0;
-                        last_idle_ping_at = Instant::now();
-                        inband_hello_snapshot =
-                            build_effective_hello(config, app.as_ref(), &mut power_runtime);
-                        continuity.apply_to_hello(&mut inband_hello_snapshot);
-                        upgrade_probe_runtime = UpgradeProbeRuntime::new(transport, Instant::now());
-                        let mobility_mode = mobility_tracker.in_mode(Instant::now());
-                        upgrade_probe_runtime.schedule_next(
+                        maintenance.refresh_after_cutover(
                             config,
                             app.as_ref(),
-                            &power_runtime,
-                            Instant::now(),
-                            mobility_mode,
+                            ActiveTransport {
+                                continuity,
+                                power_runtime: &mut power_runtime,
+                                transport: &mut transport,
+                                io: &mut io,
+                            },
+                            &mut mobility_tracker,
+                            &candidate_welcome,
                         );
                         purge_old_migrations(&mut migration_history, Instant::now());
                         migration_history.push_back(Instant::now());
@@ -1010,11 +1013,15 @@ async fn run_client_session_once(
         }
         let now = Instant::now();
         let mobility_mode = mobility_tracker.in_mode(now);
-        let recv_timeout_ms =
-            next_recv_timeout_ms(config, &upgrade_probe_runtime, now, mobility_mode)
-                .unwrap_or(idle_timeout_ms)
-                .min(idle_timeout_ms)
-                .max(1);
+        let recv_timeout_ms = next_recv_timeout_ms(
+            config,
+            &maintenance.upgrade_probe_runtime,
+            now,
+            mobility_mode,
+        )
+        .unwrap_or(maintenance.idle_timeout_ms)
+        .min(maintenance.idle_timeout_ms)
+        .max(1);
         let frame = match await_value_or_control_change(
             config,
             app.as_ref(),
@@ -1081,24 +1088,17 @@ async fn run_client_session_once(
                             )
                             .await?
                         {
-                            continuity.note_welcome(candidate_welcome.resume_token.as_deref());
-                            idle_timeout_ms =
-                                u64::from(candidate_welcome.ping_interval_secs.clamp(5, 30))
-                                    * 1_000;
-                            idle_timeout_streak = 0;
-                            last_idle_ping_at = Instant::now();
-                            inband_hello_snapshot =
-                                build_effective_hello(config, app.as_ref(), &mut power_runtime);
-                            continuity.apply_to_hello(&mut inband_hello_snapshot);
-                            upgrade_probe_runtime =
-                                UpgradeProbeRuntime::new(transport, Instant::now());
-                            let mobility_mode = mobility_tracker.in_mode(Instant::now());
-                            upgrade_probe_runtime.schedule_next(
+                            maintenance.refresh_after_cutover(
                                 config,
                                 app.as_ref(),
-                                &power_runtime,
-                                Instant::now(),
-                                mobility_mode,
+                                ActiveTransport {
+                                    continuity,
+                                    power_runtime: &mut power_runtime,
+                                    transport: &mut transport,
+                                    io: &mut io,
+                                },
+                                &mut mobility_tracker,
+                                &candidate_welcome,
                             );
                             purge_old_migrations(&mut migration_history, Instant::now());
                             migration_history.push_back(Instant::now());
@@ -1113,8 +1113,8 @@ async fn run_client_session_once(
             }
             WaitWithControl::Value(result) => match result {
                 Ok(frame) => {
-                    idle_timeout_streak = 0;
-                    last_idle_ping_at = Instant::now();
+                    maintenance.idle_timeout_streak = 0;
+                    maintenance.last_idle_ping_at = Instant::now();
                     health_tracker.note_frame_progress(Instant::now());
                     frame
                 }
@@ -1122,7 +1122,10 @@ async fn run_client_session_once(
                     let now = Instant::now();
                     health_tracker.note_timeout();
                     mobility_tracker.note_timeout(now);
-                    if upgrade_probe_runtime.should_probe(config, now, mobility_mode) {
+                    if maintenance
+                        .upgrade_probe_runtime
+                        .should_probe(config, now, mobility_mode)
+                    {
                         if continuity.can_switch_without_loss() {
                             let policy_input = if config.policy.scheduler_v2_enabled {
                                 app.scheduler_policy()
@@ -1221,30 +1224,17 @@ async fn run_client_session_once(
                                                 required_windows
                                             ),
                                         );
-                                        continuity.note_welcome(
-                                            candidate_welcome.resume_token.as_deref(),
-                                        );
-                                        idle_timeout_ms = u64::from(
-                                            candidate_welcome.ping_interval_secs.clamp(5, 30),
-                                        ) * 1_000;
-                                        idle_timeout_streak = 0;
-                                        last_idle_ping_at = Instant::now();
-                                        inband_hello_snapshot = build_effective_hello(
+                                        maintenance.refresh_after_cutover(
                                             config,
                                             app.as_ref(),
-                                            &mut power_runtime,
-                                        );
-                                        continuity.apply_to_hello(&mut inband_hello_snapshot);
-                                        upgrade_probe_runtime =
-                                            UpgradeProbeRuntime::new(transport, Instant::now());
-                                        let mobility_mode =
-                                            mobility_tracker.in_mode(Instant::now());
-                                        upgrade_probe_runtime.schedule_next(
-                                            config,
-                                            app.as_ref(),
-                                            &power_runtime,
-                                            Instant::now(),
-                                            mobility_mode,
+                                            ActiveTransport {
+                                                continuity,
+                                                power_runtime: &mut power_runtime,
+                                                transport: &mut transport,
+                                                io: &mut io,
+                                            },
+                                            &mut mobility_tracker,
+                                            &candidate_welcome,
                                         );
                                         purge_old_migrations(
                                             &mut migration_history,
@@ -1273,7 +1263,7 @@ async fn run_client_session_once(
                                     );
                                 }
                             }
-                            upgrade_probe_runtime.note_probe_failure(
+                            maintenance.upgrade_probe_runtime.note_probe_failure(
                                 config,
                                 app.as_ref(),
                                 &power_runtime,
@@ -1281,7 +1271,7 @@ async fn run_client_session_once(
                                 mobility_mode,
                             );
                         } else {
-                            upgrade_probe_runtime.note_probe_skip(
+                            maintenance.upgrade_probe_runtime.note_probe_skip(
                                 config,
                                 app.as_ref(),
                                 &power_runtime,
@@ -1291,17 +1281,18 @@ async fn run_client_session_once(
                         }
                     }
 
-                    if now.saturating_duration_since(last_idle_ping_at)
-                        >= Duration::from_millis(idle_timeout_ms)
+                    if now.saturating_duration_since(maintenance.last_idle_ping_at)
+                        >= Duration::from_millis(maintenance.idle_timeout_ms)
                     {
-                        idle_timeout_streak = idle_timeout_streak.saturating_add(1);
+                        maintenance.idle_timeout_streak =
+                            maintenance.idle_timeout_streak.saturating_add(1);
                         let dead_air_secs = health_tracker
                             .snapshot(now)
                             .dead_air_secs
                             .unwrap_or_default();
-                        if idle_timeout_streak >= 3
+                        if maintenance.idle_timeout_streak >= 3
                             && dead_air_secs >= u64::from(config.policy.health_dead_air_secs)
-                            && upgrade_probe_runtime.probe_failure_streak
+                            && maintenance.upgrade_probe_runtime.probe_failure_streak
                                 >= config.policy.dead_connection_probe_failure_threshold
                         {
                             let _ = app.on_event(ClientEvent::DeadConnectionDetected {
@@ -1341,35 +1332,24 @@ async fn run_client_session_once(
                                         tier: 2,
                                         reason_code: "alternate_transport_recovery".to_string(),
                                     });
-                                    continuity
-                                        .note_welcome(candidate_welcome.resume_token.as_deref());
-                                    idle_timeout_ms = u64::from(
-                                        candidate_welcome.ping_interval_secs.clamp(5, 30),
-                                    ) * 1_000;
-                                    idle_timeout_streak = 0;
-                                    last_idle_ping_at = Instant::now();
-                                    inband_hello_snapshot = build_effective_hello(
+                                    maintenance.refresh_after_cutover(
                                         config,
                                         app.as_ref(),
-                                        &mut power_runtime,
-                                    );
-                                    continuity.apply_to_hello(&mut inband_hello_snapshot);
-                                    upgrade_probe_runtime =
-                                        UpgradeProbeRuntime::new(transport, Instant::now());
-                                    let mobility_mode = mobility_tracker.in_mode(Instant::now());
-                                    upgrade_probe_runtime.schedule_next(
-                                        config,
-                                        app.as_ref(),
-                                        &power_runtime,
-                                        Instant::now(),
-                                        mobility_mode,
+                                        ActiveTransport {
+                                            continuity,
+                                            power_runtime: &mut power_runtime,
+                                            transport: &mut transport,
+                                            io: &mut io,
+                                        },
+                                        &mut mobility_tracker,
+                                        &candidate_welcome,
                                     );
                                     continue;
                                 }
                             }
                             return Ok(());
                         }
-                        if idle_timeout_streak >= 4 {
+                        if maintenance.idle_timeout_streak >= 4 {
                             let _ = app.on_event(ClientEvent::Disconnected {
                                 transport,
                                 reason: "idle timeout".to_string(),
@@ -1378,7 +1358,7 @@ async fn run_client_session_once(
                         }
                         let ping = config.wire_profile.encode_client_ping();
                         io.send_frame(&ping, config.policy.write_timeout_ms).await?;
-                        last_idle_ping_at = now;
+                        maintenance.last_idle_ping_at = now;
                         if pending_ping_sent_at.is_none() {
                             pending_ping_sent_at = Some(now);
                             pending_ping_source = Some(ProbeRttSource::IdleKeepalive);
@@ -1575,6 +1555,45 @@ async fn handle_primary_frame(
             "unexpected welcome frame after handshake".to_string(),
         )),
         DecodedServerFrame::Unknown => Ok(()),
+    }
+}
+
+struct SessionMaintenance {
+    idle_timeout_ms: u64,
+    idle_timeout_streak: u8,
+    last_idle_ping_at: Instant,
+    inband_hello_snapshot: HelloCtx,
+    upgrade_probe_runtime: UpgradeProbeRuntime,
+}
+
+impl SessionMaintenance {
+    fn refresh_after_cutover(
+        &mut self,
+        config: &ClientConfig,
+        app: &dyn ClientApp,
+        active: ActiveTransport<'_>,
+        mobility_tracker: &mut MobilityTracker,
+        welcome: &warp_link_core::WelcomeMsg,
+    ) {
+        active
+            .continuity
+            .note_welcome(welcome.resume_token.as_deref());
+        self.idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
+        self.idle_timeout_streak = 0;
+        self.last_idle_ping_at = Instant::now();
+        self.inband_hello_snapshot = build_effective_hello(config, app, active.power_runtime);
+        active
+            .continuity
+            .apply_to_hello(&mut self.inband_hello_snapshot);
+        self.upgrade_probe_runtime = UpgradeProbeRuntime::new(*active.transport, Instant::now());
+        let mobility_mode = mobility_tracker.in_mode(Instant::now());
+        self.upgrade_probe_runtime.schedule_next(
+            config,
+            app,
+            active.power_runtime,
+            Instant::now(),
+            mobility_mode,
+        );
     }
 }
 
@@ -2076,10 +2095,9 @@ async fn probe_higher_priority_transport(
     current: TransportKind,
     policy: &PolicyInput,
 ) -> Option<(TransportKind, ClientIo)> {
-    let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
     let required = required_transport_active(policy);
     let preferred = preferred_transport_active(policy);
-    let mut candidates: Vec<TransportKind> = if let Some(required_transport) = required {
+    let candidates: Vec<TransportKind> = if let Some(required_transport) = required {
         if required_transport == current || transport_disabled_by_policy(policy, required_transport)
         {
             Vec::new()
@@ -2096,49 +2114,7 @@ async fn probe_higher_priority_transport(
         reorder_with_preference(ordered, preferred)
     };
 
-    for (index, transport) in candidates.drain(..).enumerate() {
-        let candidate_config = config.clone();
-        let delay_ms = transport_start_delay_ms(config, transport, index);
-        attempts.spawn(async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            (
-                transport,
-                connect_transport(&candidate_config, transport).await,
-            )
-        });
-    }
-
-    if attempts.is_empty() {
-        return None;
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(config.policy.upgrade_probe_timeout_ms);
-    while !attempts.is_empty() {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        let remain = deadline.saturating_duration_since(now);
-        let join = match timeout(remain, attempts.join_next()).await {
-            Ok(value) => value,
-            Err(_) => break,
-        };
-        let Some(result) = join else {
-            break;
-        };
-        let Ok((transport, io_result)) = result else {
-            continue;
-        };
-        if let Ok(io) = io_result {
-            attempts.abort_all();
-            return Some((transport, io));
-        }
-    }
-
-    attempts.abort_all();
-    None
+    probe_transport_candidates(config, candidates).await
 }
 
 async fn probe_alternate_transport(
@@ -2146,10 +2122,9 @@ async fn probe_alternate_transport(
     current: TransportKind,
     policy: &PolicyInput,
 ) -> Option<(TransportKind, ClientIo)> {
-    let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
     let required = required_transport_active(policy);
     let preferred = preferred_transport_active(policy);
-    let mut candidates: Vec<TransportKind> = if let Some(required_transport) = required {
+    let candidates: Vec<TransportKind> = if let Some(required_transport) = required {
         if required_transport == current || transport_disabled_by_policy(policy, required_transport)
         {
             Vec::new()
@@ -2164,6 +2139,14 @@ async fn probe_alternate_transport(
             .collect();
         reorder_with_preference(ordered, preferred)
     };
+    probe_transport_candidates(config, candidates).await
+}
+
+async fn probe_transport_candidates(
+    config: &ClientConfig,
+    mut candidates: Vec<TransportKind>,
+) -> Option<(TransportKind, ClientIo)> {
+    let mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)> = JoinSet::new();
     for (index, transport) in candidates.drain(..).enumerate() {
         let candidate_config = config.clone();
         let delay_ms = transport_start_delay_ms(config, transport, index);
@@ -2177,10 +2160,19 @@ async fn probe_alternate_transport(
             )
         });
     }
+
+    first_successful_probe(attempts, config.policy.upgrade_probe_timeout_ms).await
+}
+
+async fn first_successful_probe(
+    mut attempts: JoinSet<(TransportKind, Result<ClientIo, WarpLinkError>)>,
+    timeout_ms: u64,
+) -> Option<(TransportKind, ClientIo)> {
     if attempts.is_empty() {
         return None;
     }
-    let deadline = Instant::now() + Duration::from_millis(config.policy.upgrade_probe_timeout_ms);
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while !attempts.is_empty() {
         let now = Instant::now();
         if now >= deadline {
@@ -2202,6 +2194,7 @@ async fn probe_alternate_transport(
             return Some((transport, io));
         }
     }
+
     attempts.abort_all();
     None
 }
@@ -4003,7 +3996,7 @@ mod tests {
         }
     }
 
-    fn sample_client_config() -> ClientConfig {
+    pub(super) fn sample_client_config() -> ClientConfig {
         ClientConfig {
             host: "localhost".to_string(),
             quic_port: 443,
@@ -4622,3 +4615,9 @@ mod tests {
         peer.await.expect("peer task should finish");
     }
 }
+
+#[cfg(all(test, feature = "wss"))]
+mod cutover_simplification_tests;
+
+#[cfg(all(test, feature = "wss"))]
+mod probe_simplification_tests;
