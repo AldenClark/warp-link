@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use warp_link_core::{
-    AckMsg, AckStatus, DecodedClientFrame, DecodedServerFrame, DeliverMsg, HelloCtx, WelcomeMsg,
-    WireError, WireProfile,
+    AckMsg, AckStatus, DecodedClientFrame, DecodedServerFrame, DeliverMsg, HelloCtx,
+    MAX_FRAME_BYTES, WelcomeMsg, WireError, WireProfile,
 };
 
 pub const WIRE_CODEC_POSTCARD: u8 = 1;
@@ -287,17 +287,27 @@ impl WireProfile for PushgoWireProfile {
     }
 
     fn encode_server_deliver(&self, msg: &DeliverMsg) -> Result<Bytes, WireError> {
+        if msg.payload.len() > MAX_FRAME_BYTES || msg.id.len() > MAX_FRAME_BYTES {
+            return Err(WireError::InvalidFrame(format!(
+                "deliver exceeds {MAX_FRAME_BYTES}-byte frame limit: payload={}, id={}",
+                msg.payload.len(),
+                msg.id.len()
+            )));
+        }
         let payload = postcard::to_allocvec(&DeliverWire {
             seq: msg.seq.unwrap_or(0),
             delivery_id: msg.id.clone(),
             payload: msg.payload.to_vec(),
         })
         .map_err(|e| WireError::Encode(e.to_string()))?;
-        Ok(encode_frame(
-            FrameType::Deliver,
-            postcard_v1_flags(),
-            &payload,
-        ))
+        let frame = encode_frame(FrameType::Deliver, postcard_v1_flags(), &payload);
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(WireError::InvalidFrame(format!(
+                "deliver frame has {} bytes, limit is {MAX_FRAME_BYTES}",
+                frame.len()
+            )));
+        }
+        Ok(frame)
     }
 
     fn encode_server_ping(&self) -> Bytes {
@@ -339,6 +349,9 @@ fn encode_frame(ty: FrameType, flags: u8, payload: &[u8]) -> Bytes {
 }
 
 fn decode_frame(frame: &[u8]) -> Result<(FrameType, u8, &[u8]), WireError> {
+    if frame.len() > MAX_FRAME_BYTES {
+        return Err(WireError::InvalidFrame("frame exceeds limit".to_string()));
+    }
     if frame.len() < 2 {
         return Err(WireError::InvalidFrame("frame too short".to_string()));
     }
@@ -534,6 +547,57 @@ mod tests {
             }
             other => panic!("unexpected decoded frame: {other:?}"),
         }
+    }
+
+    #[test]
+    fn deliver_accepts_exact_64k_full_frame_and_rejects_one_more_byte() {
+        let profile = PushgoWireProfile::new();
+        assert_eq!(MAX_FRAME_BYTES, 65_536);
+        // Full frame: type/flags(2), max u64 seq(10), ID(1+32), payload length(3).
+        let mut message = DeliverMsg {
+            seq: Some(u64::MAX),
+            id: "d".repeat(32),
+            payload: Bytes::from(vec![b'x'; 65_536 - 48]),
+        };
+        let frame = profile.encode_server_deliver(&message).unwrap();
+        assert_eq!(frame.len(), 65_536);
+        match profile.decode_server_frame(&frame).unwrap() {
+            DecodedServerFrame::Deliver(decoded) => {
+                assert_eq!(decoded.seq, message.seq);
+                assert_eq!(decoded.id, message.id);
+                assert_eq!(decoded.payload, message.payload);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+        message.payload = Bytes::from(vec![b'x'; 65_536 - 47]);
+        assert!(matches!(
+            profile.encode_server_deliver(&message),
+            Err(WireError::InvalidFrame(_))
+        ));
+        // Decoder rejects the same valid postcard wire shape at one byte over.
+        let payload = postcard::to_allocvec(&DeliverWire {
+            seq: u64::MAX,
+            delivery_id: message.id,
+            payload: message.payload.to_vec(),
+        })
+        .unwrap();
+        let over = encode_frame(FrameType::Deliver, postcard_v1_flags(), &payload);
+        assert_eq!(over.len(), 65_537);
+        assert!(matches!(
+            profile.decode_server_frame(&over),
+            Err(WireError::InvalidFrame(_))
+        ));
+    }
+
+    #[test]
+    fn decoder_bounds_client_control_frames_before_postcard() {
+        let mut frame = vec![0; MAX_FRAME_BYTES + 1];
+        frame[0] = FrameType::ClientHello as u8;
+        frame[1] = postcard_v1_flags();
+        assert!(matches!(
+            PushgoWireProfile::new().decode_client_frame(&frame),
+            Err(WireError::InvalidFrame(_))
+        ));
     }
 
     #[test]

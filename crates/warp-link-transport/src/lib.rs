@@ -16,9 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
-use warp_link_core::{ClientConfig, WarpLinkError};
-
-const MAX_FRAME_LEN: usize = (32 * 1024) + 2;
+use warp_link_core::{ClientConfig, MAX_FRAME_BYTES as MAX_FRAME_LEN, WarpLinkError};
 
 #[derive(Debug)]
 enum FrameReadState {
@@ -730,6 +728,96 @@ mod tests {
             .await
             .expect_err("oversized frame should be rejected");
         assert!(matches!(error, WarpLinkError::Protocol(_)));
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_roundtrips_exact_64k_frame_excluding_u32_prefix() {
+        assert_eq!(MAX_FRAME_LEN, 65_536);
+        let (mut writer, input) = tokio::io::duplex(1024);
+        let send = tokio::spawn(async move {
+            write_prefixed_frame(&mut writer, &vec![b'x'; 65_536])
+                .await
+                .unwrap();
+        });
+        let mut reader = FramedReader::new(input);
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+        let frame = timeout(Duration::from_secs(1), reader.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, vec![b'x'; 65_536]);
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+
+        let (mut writer, mut input) = tokio::io::duplex(8);
+        let send = tokio::spawn(async move {
+            write_prefixed_frame(&mut writer, &vec![b'x'; 65_536])
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            timeout(Duration::from_secs(1), input.read_u32())
+                .await
+                .unwrap()
+                .unwrap(),
+            65_536
+        );
+        let mut frame = vec![0; 65_536];
+        timeout(Duration::from_secs(1), input.read_exact(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, vec![b'x'; 65_536]);
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_writer_rejects_one_over_64k_before_writing_prefix() {
+        let (mut writer, mut input) = tokio::io::duplex(8);
+        assert!(matches!(
+            write_prefixed_frame(&mut writer, &vec![0; 65_537]).await,
+            Err(WarpLinkError::Protocol(_))
+        ));
+        drop(writer);
+        assert_eq!(
+            input.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_accepts_exact_64k_message_and_rejects_one_over() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        for size in [65_536, 65_537] {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let send = tokio::spawn(async move {
+                server
+                    .send(Message::Binary(vec![b'x'; size].into()))
+                    .await
+                    .unwrap();
+            });
+            let frame = timeout(Duration::from_secs(1), recv_wss_frame(&mut client, 1000))
+                .await
+                .unwrap();
+            if size == 65_536 {
+                assert_eq!(frame.unwrap().len(), size);
+            } else {
+                assert!(matches!(frame, Err(WarpLinkError::Protocol(_))));
+            }
+            timeout(Duration::from_secs(1), send)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

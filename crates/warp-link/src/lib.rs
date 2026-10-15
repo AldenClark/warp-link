@@ -65,7 +65,7 @@ use warp_link_transport::{FramedReader, write_prefixed_frame};
 pub use warp_link_core;
 pub use warp_link_transport;
 
-const TRANSPORT_MAX_FRAME_BYTES: u32 = ((32 * 1024) + 2) as u32;
+const TRANSPORT_MAX_FRAME_BYTES: u32 = warp_link_core::MAX_FRAME_BYTES as u32;
 
 #[derive(Default)]
 struct ClientContinuityState {
@@ -2369,7 +2369,7 @@ impl Default for WssStandaloneConfig {
             path: "/private/ws".to_string(),
             tls_mode: TlsMode::OffloadAtEdge,
             subprotocol: None,
-            max_frame_bytes: (32 * 1024) + 2,
+            max_frame_bytes: warp_link_core::MAX_FRAME_BYTES,
         }
     }
 }
@@ -4488,6 +4488,11 @@ mod tests {
 
     #[test]
     fn welcome_must_select_offered_versions_and_a_bounded_frame_size() {
+        assert_eq!(TRANSPORT_MAX_FRAME_BYTES, 65_536);
+        assert_eq!(
+            super::WssStandaloneConfig::default().max_frame_bytes,
+            65_536
+        );
         let hello = warp_link_core::HelloCtx {
             supported_wire_versions: vec![2],
             supported_payload_versions: vec![1],
