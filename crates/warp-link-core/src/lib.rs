@@ -10,7 +10,7 @@ use bytes::Bytes;
 /// Maximum complete application frame, including type and flags bytes.
 /// The four-byte u32 TCP/QUIC stream length prefix is not part of this limit.
 /// Readers validate the declared length before allocating a payload buffer.
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {

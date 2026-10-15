@@ -550,17 +550,17 @@ mod tests {
     }
 
     #[test]
-    fn deliver_accepts_exact_64k_full_frame_and_rejects_one_more_byte() {
+    fn deliver_accepts_exact_128k_full_frame_and_rejects_one_more_byte() {
         let profile = PushgoWireProfile::new();
-        assert_eq!(MAX_FRAME_BYTES, 65_536);
+        assert_eq!(MAX_FRAME_BYTES, 131_072);
         // Full frame: type/flags(2), max u64 seq(10), ID(1+32), payload length(3).
         let mut message = DeliverMsg {
             seq: Some(u64::MAX),
             id: "d".repeat(32),
-            payload: Bytes::from(vec![b'x'; 65_536 - 48]),
+            payload: Bytes::from(vec![b'x'; 131_072 - 48]),
         };
         let frame = profile.encode_server_deliver(&message).unwrap();
-        assert_eq!(frame.len(), 65_536);
+        assert_eq!(frame.len(), 131_072);
         match profile.decode_server_frame(&frame).unwrap() {
             DecodedServerFrame::Deliver(decoded) => {
                 assert_eq!(decoded.seq, message.seq);
@@ -569,7 +569,7 @@ mod tests {
             }
             other => panic!("unexpected frame: {other:?}"),
         }
-        message.payload = Bytes::from(vec![b'x'; 65_536 - 47]);
+        message.payload = Bytes::from(vec![b'x'; 131_072 - 47]);
         assert!(matches!(
             profile.encode_server_deliver(&message),
             Err(WireError::InvalidFrame(_))
@@ -582,7 +582,7 @@ mod tests {
         })
         .unwrap();
         let over = encode_frame(FrameType::Deliver, postcard_v1_flags(), &payload);
-        assert_eq!(over.len(), 65_537);
+        assert_eq!(over.len(), 131_073);
         assert!(matches!(
             profile.decode_server_frame(&over),
             Err(WireError::InvalidFrame(_))

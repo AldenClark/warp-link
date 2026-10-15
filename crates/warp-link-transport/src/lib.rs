@@ -732,11 +732,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_roundtrips_exact_64k_frame_excluding_u32_prefix() {
-        assert_eq!(MAX_FRAME_LEN, 65_536);
+    async fn stream_roundtrips_exact_128k_frame_excluding_u32_prefix() {
+        assert_eq!(MAX_FRAME_LEN, 131_072);
         let (mut writer, input) = tokio::io::duplex(1024);
         let send = tokio::spawn(async move {
-            write_prefixed_frame(&mut writer, &vec![b'x'; 65_536])
+            write_prefixed_frame(&mut writer, &vec![b'x'; 131_072])
                 .await
                 .unwrap();
         });
@@ -746,7 +746,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(frame, vec![b'x'; 65_536]);
+        assert_eq!(frame, vec![b'x'; 131_072]);
         timeout(Duration::from_secs(1), send)
             .await
             .unwrap()
@@ -755,7 +755,7 @@ mod tests {
 
         let (mut writer, mut input) = tokio::io::duplex(8);
         let send = tokio::spawn(async move {
-            write_prefixed_frame(&mut writer, &vec![b'x'; 65_536])
+            write_prefixed_frame(&mut writer, &vec![b'x'; 131_072])
                 .await
                 .unwrap();
         });
@@ -764,14 +764,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            65_536
+            131_072
         );
-        let mut frame = vec![0; 65_536];
+        let mut frame = vec![0; 131_072];
         timeout(Duration::from_secs(1), input.read_exact(&mut frame))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(frame, vec![b'x'; 65_536]);
+        assert_eq!(frame, vec![b'x'; 131_072]);
         timeout(Duration::from_secs(1), send)
             .await
             .unwrap()
@@ -779,10 +779,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_writer_rejects_one_over_64k_before_writing_prefix() {
+    async fn stream_writer_rejects_one_over_128k_before_writing_prefix() {
         let (mut writer, mut input) = tokio::io::duplex(8);
         assert!(matches!(
-            write_prefixed_frame(&mut writer, &vec![0; 65_537]).await,
+            write_prefixed_frame(&mut writer, &vec![0; 131_073]).await,
             Err(WarpLinkError::Protocol(_))
         ));
         drop(writer);
@@ -793,9 +793,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wss_accepts_exact_64k_message_and_rejects_one_over() {
+    async fn wss_accepts_exact_128k_message_and_rejects_one_over() {
         use tokio_tungstenite::tungstenite::protocol::Role;
-        for size in [65_536, 65_537] {
+        for size in [131_072, 131_073] {
             let (client_io, server_io) = tokio::io::duplex(1024);
             let mut client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
             let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
@@ -808,7 +808,7 @@ mod tests {
             let frame = timeout(Duration::from_secs(1), recv_wss_frame(&mut client, 1000))
                 .await
                 .unwrap();
-            if size == 65_536 {
+            if size == 131_072 {
                 assert_eq!(frame.unwrap().len(), size);
             } else {
                 assert!(matches!(frame, Err(WarpLinkError::Protocol(_))));

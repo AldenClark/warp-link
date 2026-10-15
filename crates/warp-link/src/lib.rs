@@ -4488,10 +4488,10 @@ mod tests {
 
     #[test]
     fn welcome_must_select_offered_versions_and_a_bounded_frame_size() {
-        assert_eq!(TRANSPORT_MAX_FRAME_BYTES, 65_536);
+        assert_eq!(TRANSPORT_MAX_FRAME_BYTES, 131_072);
         assert_eq!(
             super::WssStandaloneConfig::default().max_frame_bytes,
-            65_536
+            131_072
         );
         let hello = warp_link_core::HelloCtx {
             supported_wire_versions: vec![2],
