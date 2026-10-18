@@ -28,7 +28,7 @@ The host must continuously drain `wl_session_poll_event` or `wl_session_poll_eve
 
 ## Toolchain
 
-- `stable` Rust toolchain
+- Repository-pinned Rust toolchain (`rust-toolchain.toml`)
 - `rustfmt`, `clippy` components enabled
 
 ## Transport Features
@@ -38,6 +38,19 @@ The host must continuously drain `wl_session_poll_event` or `wl_session_poll_eve
 - `wss`
 
 Default enables all features.
+
+## Private Frame Contract
+
+`warp_link_core::MAX_FRAME_BYTES` is 131,072 bytes (128 KiB), including the
+type/flags header and encoded content. TCP/QUIC's four-byte length prefix and
+WebSocket envelope bytes are excluded. WSS also bounds individual frames and
+reassembled messages. WELCOME advertises the same application-frame limit.
+Old Private clients may reject this WELCOME and must be upgraded; WSS is not
+a compatibility fallback. The Gateway's 48 KiB whole-HTTP-request limit is a
+separate application-layer contract, not a Warp payload allowance.
+
+See [the integration record](./PRIVATE128_INTEGRATION.md) for tested scope,
+source identity, and downstream adoption limits.
 
 ## Verification
 

@@ -28,7 +28,7 @@
 
 ## 工具链
 
-- Rust `stable`
+- 仓库固定的 Rust 工具链（`rust-toolchain.toml`）
 - 启用 `rustfmt`、`clippy`
 
 ## 传输特性
@@ -38,6 +38,16 @@
 - `wss`
 
 默认启用全部传输特性。
+
+## Private 帧合同
+
+`warp_link_core::MAX_FRAME_BYTES` 为 131,072 字节（128 KiB），包含
+type/flags 帧头及编码内容；不包含 TCP/QUIC 的四字节长度前缀或 WebSocket
+自身封装。WSS 同时限制单帧和重组后消息。WELCOME 宣告同一个应用帧上限。
+旧 Private 客户端可能拒绝该 WELCOME，必须配套升级；WSS 不提供兼容旁路。
+Gateway 的 48 KiB 整个 HTTP 请求限制属于上层合同，不是 Warp 正文容量。
+
+已验证范围、源码身份和下游采用边界见[整合记录](./PRIVATE128_INTEGRATION.md)。
 
 ## 验证命令
 
