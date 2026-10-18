@@ -65,7 +65,7 @@ use warp_link_transport::{FramedReader, write_prefixed_frame};
 pub use warp_link_core;
 pub use warp_link_transport;
 
-const TRANSPORT_MAX_FRAME_BYTES: u32 = ((32 * 1024) + 2) as u32;
+const TRANSPORT_MAX_FRAME_BYTES: u32 = warp_link_core::MAX_FRAME_BYTES as u32;
 
 #[derive(Default)]
 struct ClientContinuityState {
@@ -2362,7 +2362,7 @@ impl Default for WssStandaloneConfig {
             path: "/private/ws".to_string(),
             tls_mode: TlsMode::OffloadAtEdge,
             subprotocol: None,
-            max_frame_bytes: (32 * 1024) + 2,
+            max_frame_bytes: warp_link_core::MAX_FRAME_BYTES,
         }
     }
 }
@@ -4481,6 +4481,11 @@ mod tests {
 
     #[test]
     fn welcome_must_select_offered_versions_and_a_bounded_frame_size() {
+        assert_eq!(TRANSPORT_MAX_FRAME_BYTES, 131_072);
+        assert_eq!(
+            super::WssStandaloneConfig::default().max_frame_bytes,
+            131_072
+        );
         let hello = warp_link_core::HelloCtx {
             supported_wire_versions: vec![2],
             supported_payload_versions: vec![1],
@@ -4503,6 +4508,30 @@ mod tests {
         };
         validate_welcome_negotiation(&hello, &welcome)
             .expect("offered versions and bounded frame size should pass");
+
+        // Execute the fixed old source against a currently valid WELCOME.
+        // This proves the validation hard cut, not an old-client network exchange.
+        mod legacy_dbae3a8 {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/legacy_dbae3a8_welcome.rs"
+            ));
+            pub(super) fn validate(
+                hello: &warp_link_core::HelloCtx,
+                welcome: &warp_link_core::WelcomeMsg,
+            ) -> Result<(), warp_link_core::WarpLinkError> {
+                validate_welcome_negotiation(hello, welcome)
+            }
+        }
+        assert!(matches!(
+            legacy_dbae3a8::validate(&hello, &welcome),
+            Err(WarpLinkError::Protocol(reason))
+                if reason == "server selected invalid max frame bytes 131072"
+        ));
+        let mut legacy_bounded = welcome.clone();
+        legacy_bounded.max_frame_bytes = 32 * 1024 + 2;
+        legacy_dbae3a8::validate(&hello, &legacy_bounded)
+            .expect("same historical validator accepts its original boundary");
 
         welcome.negotiated_wire_version = 9;
         assert!(matches!(

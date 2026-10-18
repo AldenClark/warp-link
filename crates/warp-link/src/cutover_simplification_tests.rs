@@ -170,6 +170,26 @@ fn continuity() -> ClientContinuityState {
 
 #[tokio::test]
 async fn successful_cutover_refreshes_hello_and_hands_off_ack_once() {
+    assert_successful_cutover(Bytes::from_static(b"payload")).await;
+}
+
+#[tokio::test]
+async fn successful_cutover_hands_off_exact_128k_guard_delivery() {
+    // This envelope has a two-byte header, one-byte seq, eight-byte ID field,
+    // and three-byte payload length. It is a codec payload, not business JSON.
+    let payload = Bytes::from(vec![b'x'; warp_link_core::MAX_FRAME_BYTES - 14]);
+    let frame = PushgoWireProfile
+        .encode_server_deliver(&DeliverMsg {
+            seq: Some(8),
+            id: "handoff".into(),
+            payload: payload.clone(),
+        })
+        .unwrap();
+    assert_eq!(frame.len(), warp_link_core::MAX_FRAME_BYTES);
+    assert_successful_cutover(payload).await;
+}
+
+async fn assert_successful_cutover(payload: Bytes) {
     let config = config();
     let app = Arc::new(RecordingApp::new());
     let (mut active_io, mut old_peer) = loopback_pair().await;
@@ -180,6 +200,7 @@ async fn successful_cutover_refreshes_hello_and_hands_off_ack_once() {
     let (hello_seen_tx, hello_seen_rx) = oneshot::channel();
     let (welcome_tx, welcome_rx) = oneshot::channel();
     let profile = Arc::clone(&config.wire_profile);
+    let expected_payload = payload.clone();
     let peer = tokio::spawn(async move {
         let DecodedClientFrame::Hello(hello) = recv(&mut new_peer, profile.as_ref()).await else {
             panic!("candidate must send Hello");
@@ -203,7 +224,7 @@ async fn successful_cutover_refreshes_hello_and_hands_off_ack_once() {
                 .encode_server_deliver(&DeliverMsg {
                     seq: Some(8),
                     id: "handoff".into(),
-                    payload: Bytes::from_static(b"payload"),
+                    payload,
                 })
                 .unwrap(),
         )
@@ -371,6 +392,14 @@ async fn successful_cutover_refreshes_hello_and_hands_off_ack_once() {
     assert_eq!(app.count(|e| matches!(e, ClientEvent::Connected { .. })), 1);
     assert_eq!(app.count(|e| matches!(e, ClientEvent::Welcome { .. })), 1);
     assert_eq!(app.count(|e| matches!(e, ClientEvent::Message { .. })), 1);
+    assert_eq!(
+        app.count(|e| matches!(
+            e,
+            ClientEvent::Message { msg, .. }
+                if msg.seq == Some(8) && msg.id == "handoff" && msg.payload == expected_payload
+        )),
+        1
+    );
     assert_eq!(
         app.count(|e| matches!(e, ClientEvent::CutoverRollback { .. })),
         0
