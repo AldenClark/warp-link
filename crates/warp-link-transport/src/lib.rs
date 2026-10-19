@@ -819,7 +819,10 @@ mod tests {
             .unwrap();
         assert!(matches!(reader.state, FrameReadState::Length { .. }));
 
-        let (mut writer, mut input) = tokio::io::duplex(8);
+        // This raw-wire assertion checks that the prefix excludes its own bytes.
+        // Buffer the whole wire frame so it does not require thousands of task
+        // handoffs; fragmented reads are exercised by the roundtrip above.
+        let (mut writer, mut input) = tokio::io::duplex(MAX_FRAME_LEN + std::mem::size_of::<u32>());
         let send = tokio::spawn(async move {
             write_prefixed_frame(&mut writer, &vec![b'x'; 131_072])
                 .await
