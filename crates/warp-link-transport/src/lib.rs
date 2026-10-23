@@ -16,9 +16,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
 };
-use warp_link_core::{ClientConfig, WarpLinkError};
-
-const MAX_FRAME_LEN: usize = (32 * 1024) + 2;
+use warp_link_core::{ClientConfig, MAX_FRAME_BYTES as MAX_FRAME_LEN, WarpLinkError};
 
 #[derive(Debug)]
 enum FrameReadState {
@@ -348,6 +346,17 @@ pub async fn connect_quic(config: &ClientConfig) -> Result<ClientIo, WarpLinkErr
 }
 
 pub async fn connect_tcp(config: &ClientConfig) -> Result<ClientIo, WarpLinkError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    connect_tcp_with_roots(config, roots).await
+}
+
+// Private seam: production always supplies the built-in roots above. Unit tests can
+// exercise this same socket/verification path with an isolated synthetic CA.
+async fn connect_tcp_with_roots(
+    config: &ClientConfig,
+    roots: rustls::RootCertStore,
+) -> Result<ClientIo, WarpLinkError> {
     let connect_timeout = Duration::from_millis(config.policy.connect_timeout_ms.max(1));
     let deadline = tokio::time::Instant::now() + connect_timeout;
     let addrs = timeout(
@@ -375,8 +384,6 @@ pub async fn connect_tcp(config: &ClientConfig) -> Result<ClientIo, WarpLinkErro
         .set_nodelay(true)
         .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -445,12 +452,7 @@ pub async fn connect_wss(config: &ClientConfig) -> Result<ClientIo, WarpLinkErro
             .insert("Sec-WebSocket-Protocol", parsed);
     }
 
-    let websocket_config = WebSocketConfig::default()
-        .read_buffer_size(MAX_FRAME_LEN.min(16 * 1024))
-        .write_buffer_size(MAX_FRAME_LEN.min(16 * 1024))
-        .max_write_buffer_size(MAX_FRAME_LEN * 2)
-        .max_message_size(Some(MAX_FRAME_LEN))
-        .max_frame_size(Some(MAX_FRAME_LEN));
+    let websocket_config = client_websocket_config();
     let (stream, _) = timeout(
         Duration::from_millis(config.policy.connect_timeout_ms.max(1)),
         tokio_tungstenite::connect_async_with_config(request, Some(websocket_config), true),
@@ -484,6 +486,15 @@ fn url_host(host: &str) -> String {
     } else {
         host.to_string()
     }
+}
+
+fn client_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .read_buffer_size(MAX_FRAME_LEN.min(16 * 1024))
+        .write_buffer_size(MAX_FRAME_LEN.min(16 * 1024))
+        .max_write_buffer_size(MAX_FRAME_LEN * 2)
+        .max_message_size(Some(MAX_FRAME_LEN))
+        .max_frame_size(Some(MAX_FRAME_LEN))
 }
 
 pub async fn write_prefixed_frame<W>(writer: &mut W, frame: &[u8]) -> Result<(), WarpLinkError>
@@ -717,6 +728,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_128k_stream_read_resumes_and_preserves_next_frame() {
+        let (mut writer, input) = tokio::io::duplex(512);
+        let mut reader = FramedReader::new(input);
+        let prefix = (MAX_FRAME_LEN as u32).to_be_bytes();
+        writer.write_all(&prefix[..2]).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(10), reader.read_frame())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            reader.state,
+            FrameReadState::Length { read: 2, .. }
+        ));
+
+        writer.write_all(&prefix[2..]).await.unwrap();
+        writer.write_all(&[b'x'; 256]).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(10), reader.read_frame())
+                .await
+                .is_err()
+        );
+        match &reader.state {
+            FrameReadState::Payload { bytes, read } => {
+                assert_eq!(bytes.len(), MAX_FRAME_LEN);
+                assert_eq!(*read, 256);
+            }
+            other => panic!("expected partial large payload, got {other:?}"),
+        }
+
+        let send = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MAX_FRAME_LEN - 256])
+                .await
+                .unwrap();
+            write_prefixed_frame(&mut writer, b"next").await.unwrap();
+        });
+        assert_eq!(
+            timeout(Duration::from_secs(1), reader.read_frame())
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![b'x'; MAX_FRAME_LEN]
+        );
+        assert!(matches!(
+            reader.state,
+            FrameReadState::Length { read: 0, .. }
+        ));
+        assert_eq!(
+            timeout(Duration::from_secs(1), reader.read_frame())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"next"
+        );
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn framed_reader_rejects_oversized_length_before_payload_allocation() {
         let (mut writer, reader) = tokio::io::duplex(16);
         let mut reader = FramedReader::new(reader);
@@ -730,6 +803,252 @@ mod tests {
             .await
             .expect_err("oversized frame should be rejected");
         assert!(matches!(error, WarpLinkError::Protocol(_)));
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_roundtrips_exact_128k_frame_excluding_u32_prefix() {
+        assert_eq!(MAX_FRAME_LEN, 131_072);
+        let (mut writer, input) = tokio::io::duplex(1024);
+        let send = tokio::spawn(async move {
+            write_prefixed_frame(&mut writer, &vec![b'x'; 131_072])
+                .await
+                .unwrap();
+        });
+        let mut reader = FramedReader::new(input);
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+        let frame = timeout(Duration::from_secs(1), reader.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, vec![b'x'; 131_072]);
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reader.state, FrameReadState::Length { .. }));
+
+        // This raw-wire assertion checks that the prefix excludes its own bytes.
+        // Buffer the whole wire frame so it does not require thousands of task
+        // handoffs; fragmented reads are exercised by the roundtrip above.
+        let (mut writer, mut input) = tokio::io::duplex(MAX_FRAME_LEN + std::mem::size_of::<u32>());
+        let send = tokio::spawn(async move {
+            write_prefixed_frame(&mut writer, &vec![b'x'; 131_072])
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            timeout(Duration::from_secs(1), input.read_u32())
+                .await
+                .unwrap()
+                .unwrap(),
+            131_072
+        );
+        let mut frame = vec![0; 131_072];
+        timeout(Duration::from_secs(1), input.read_exact(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, vec![b'x'; 131_072]);
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_writer_rejects_one_over_128k_before_writing_prefix() {
+        let (mut writer, mut input) = tokio::io::duplex(8);
+        assert!(matches!(
+            write_prefixed_frame(&mut writer, &vec![0; 131_073]).await,
+            Err(WarpLinkError::Protocol(_))
+        ));
+        drop(writer);
+        assert_eq!(
+            input.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn wss_accepts_exact_128k_message_then_small_frames() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let mut client = WebSocketStream::from_raw_socket(
+            client_io,
+            Role::Client,
+            Some(client_websocket_config()),
+        )
+        .await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let send = tokio::spawn(async move {
+            for payload in [vec![b'x'; 131_072], b"a".to_vec(), b"bc".to_vec()] {
+                server.send(Message::Binary(payload.into())).await.unwrap();
+            }
+        });
+        for payload in [vec![b'x'; 131_072], b"a".to_vec(), b"bc".to_vec()] {
+            let frame = timeout(Duration::from_secs(1), recv_wss_frame(&mut client, 1000))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame, payload);
+        }
+        timeout(Duration::from_secs(1), send)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    // Raw WebSocket parser tests: TLS is deliberately outside this in-memory oracle.
+    #[test]
+    fn wss_raw_oversized_u64_lengths_reject_before_payload_read() {
+        use std::io::{self, Read, Write};
+        use tokio_tungstenite::tungstenite::{
+            Error, WebSocket, error::CapacityError, protocol::Role,
+        };
+
+        struct HeaderOnly(std::io::Cursor<Vec<u8>>);
+        impl Read for HeaderOnly {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    self.0.position() < self.0.get_ref().len() as u64,
+                    "oversized header must fail before requesting payload"
+                );
+                std::io::Read::read(&mut self.0, bytes)
+            }
+        }
+        impl Write for HeaderOnly {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("oversized input must not require output")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for length in [131_073_u64, (1_u64 << 32) + 2, u64::MAX] {
+            let mut header = vec![0x82, 127];
+            header.extend_from_slice(&length.to_be_bytes());
+            let mut websocket = WebSocket::from_raw_socket(
+                HeaderOnly(std::io::Cursor::new(header)),
+                Role::Client,
+                Some(client_websocket_config()),
+            );
+            assert!(
+                matches!(
+                    websocket.read(),
+                    Err(Error::Capacity(CapacityError::MessageTooLong {
+                        max_size: 131_072,
+                        ..
+                    }))
+                ),
+                "length={length}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wss_fragmented_total_respects_128k_message_limit() {
+        use tokio_tungstenite::tungstenite::{
+            Error,
+            error::CapacityError,
+            protocol::{
+                Role,
+                frame::{
+                    Frame,
+                    coding::{Data, OpCode},
+                },
+            },
+        };
+        for total in [131_072, 131_073] {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let mut client = WebSocketStream::from_raw_socket(
+                client_io,
+                Role::Client,
+                Some(client_websocket_config()),
+            )
+            .await;
+            let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+            let send = tokio::spawn(async move {
+                server
+                    .send(Message::Frame(Frame::message(
+                        vec![b'x'; 65_536],
+                        OpCode::Data(Data::Binary),
+                        false,
+                    )))
+                    .await
+                    .unwrap();
+                server
+                    .send(Message::Frame(Frame::message(
+                        vec![b'y'; total - 65_536],
+                        OpCode::Data(Data::Continue),
+                        true,
+                    )))
+                    .await
+                    .unwrap();
+            });
+            let message = timeout(Duration::from_secs(1), client.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if total == 131_072 {
+                let Message::Binary(payload) = message.unwrap() else {
+                    panic!("binary expected")
+                };
+                assert_eq!(&payload[..65_536], vec![b'x'; 65_536]);
+                assert_eq!(&payload[65_536..], vec![b'y'; 65_536]);
+            } else {
+                assert!(matches!(
+                    message,
+                    Err(Error::Capacity(CapacityError::MessageTooLong { .. }))
+                ));
+            }
+            timeout(Duration::from_secs(1), send)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_invalid_prefixes_reject_before_payload_allocation() {
+        for length in [0_u32, u32::MAX] {
+            let mut reader = FramedReader::new(std::io::Cursor::new(length.to_be_bytes()));
+            assert!(matches!(
+                reader.read_frame().await,
+                Err(WarpLinkError::Protocol(_))
+            ));
+            assert!(matches!(
+                reader.state,
+                FrameReadState::Length { read: 4, .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_truncated_prefix_and_payload_are_transport_errors() {
+        for (bytes, expected) in [
+            (vec![0, 0, 0], "length"),
+            (vec![0, 0, 0, 2, b'x'], "payload"),
+        ] {
+            let mut reader = FramedReader::new(std::io::Cursor::new(bytes));
+            let Err(WarpLinkError::Transport(reason)) = reader.read_frame().await else {
+                panic!("truncated {expected} must fail")
+            };
+            assert!(reason.contains(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_exact_128k_then_consecutive_small_frames_preserve_boundaries() {
+        let mut bytes = Vec::new();
+        for payload in [&vec![b'x'; 131_072][..], b"a", b"bc"] {
+            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(payload);
+        }
+        let mut reader = FramedReader::new(std::io::Cursor::new(bytes));
+        assert_eq!(reader.read_frame().await.unwrap(), vec![b'x'; 131_072]);
+        assert_eq!(reader.read_frame().await.unwrap(), b"a");
+        assert_eq!(reader.read_frame().await.unwrap(), b"bc");
     }
 
     #[tokio::test]
@@ -810,3 +1129,6 @@ mod tests {
         assert_eq!(url_host("gateway.example"), "gateway.example");
     }
 }
+
+#[cfg(test)]
+mod tcp_tls_tests;
