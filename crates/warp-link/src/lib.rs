@@ -758,7 +758,7 @@ async fn run_client_session_once(
     app: Arc<dyn ClientApp>,
     continuity: &mut ClientContinuityState,
 ) -> Result<(), WarpLinkError> {
-    let mut decision_id_seq: u64 = 1;
+    let decision_id_seq: u64 = 1;
     if config.policy.scheduler_v2_enabled {
         emit_scheduler_state(
             app.as_ref(),
@@ -789,7 +789,31 @@ async fn run_client_session_once(
             "all transports blocked by scheduler policy".to_string(),
         ));
     }
-    let (mut transport, mut io) = hedged_connect(config, &connect_plan).await?;
+    let (transport, io) = hedged_connect(config, &connect_plan).await?;
+    run_connected_client_session(
+        config,
+        app,
+        continuity,
+        initial_policy,
+        connect_plan,
+        transport,
+        io,
+    )
+    .await
+}
+
+// Keep connection establishment separate from the single-owner session loop. The
+// loop still uses the same concrete ClientIo and production handshake/cutover paths.
+async fn run_connected_client_session(
+    config: &ClientConfig,
+    app: Arc<dyn ClientApp>,
+    continuity: &mut ClientContinuityState,
+    initial_policy: PolicyInput,
+    connect_plan: TransportPlan,
+    mut transport: TransportKind,
+    mut io: ClientIo,
+) -> Result<(), WarpLinkError> {
+    let mut decision_id_seq = 1;
     emit_decision_trace(
         app.as_ref(),
         decision_id_seq,
@@ -1013,6 +1037,161 @@ async fn run_client_session_once(
         }
         let now = Instant::now();
         let mobility_mode = mobility_tracker.in_mode(now);
+        // Check the existing deadline independently of receive outcomes: a
+        // continuously readable primary must not starve healthy upgrades.
+        if maintenance
+            .upgrade_probe_runtime
+            .should_probe(config, now, mobility_mode)
+        {
+            if continuity.can_switch_without_loss() {
+                let policy_input = if config.policy.scheduler_v2_enabled {
+                    app.scheduler_policy()
+                } else {
+                    PolicyInput::default()
+                };
+                let probe_started_at = Instant::now();
+                let probe_candidate =
+                    probe_higher_priority_transport(config, transport, &policy_input).await;
+                if let Some((target, candidate_io)) = probe_candidate {
+                    let candidate_connect_elapsed_ms =
+                        duration_ms(Instant::now().saturating_duration_since(probe_started_at));
+                    let primary_snapshot = health_tracker.snapshot(now);
+                    let candidate_snapshot = warp_link_core::TransportHealthSnapshot {
+                        timeout_rate: Some(0.0),
+                        ack_non_ok_ratio: Some(0.0),
+                        dead_air_secs: Some(0),
+                        rtt_ewma_ms: Some(candidate_connect_elapsed_ms),
+                        rtt_jitter_ms: Some(0),
+                    };
+                    let gate_ok = health_gate_passes(&config.policy, &primary_snapshot)
+                        && health_gate_passes(&config.policy, &candidate_snapshot);
+                    let primary_score = combined_score(transport, None, &primary_snapshot);
+                    let candidate_score = combined_score(
+                        target,
+                        Some(candidate_connect_elapsed_ms),
+                        &candidate_snapshot,
+                    );
+                    let required_margin =
+                        1.0 + (f64::from(config.policy.scheduler_hysteresis_percent) / 100.0);
+                    let beats = gate_ok && candidate_score >= (primary_score * required_margin);
+                    if beats {
+                        adaptive_upgrade_streak = adaptive_upgrade_streak.saturating_add(1);
+                    } else {
+                        adaptive_upgrade_streak = 0;
+                    }
+                    let required_windows = required_upgrade_windows(&config.policy, mobility_mode);
+                    if adaptive_upgrade_streak >= required_windows {
+                        if migration_blocked_by_cooldown(
+                            &mut migration_history,
+                            &mut migration_cooldown_until,
+                            now,
+                            &config.policy,
+                        ) {
+                            emit_decision_trace(
+                                app.as_ref(),
+                                decision_id_seq,
+                                DecisionWinnerLayer::AdaptiveScheduler,
+                                "migration_cooldown_active",
+                                Some(target),
+                                Vec::new(),
+                                format!(
+                                    "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                    primary_score,
+                                    candidate_score,
+                                    adaptive_upgrade_streak,
+                                    required_windows
+                                ),
+                            );
+                            adaptive_upgrade_streak = 0;
+                        } else if let Some(candidate_welcome) = commit_candidate_cutover(
+                            config,
+                            Arc::clone(&app),
+                            ActiveTransport {
+                                continuity,
+                                power_runtime: &mut power_runtime,
+                                transport: &mut transport,
+                                io: &mut io,
+                            },
+                            target,
+                            candidate_io,
+                            decision_id_seq,
+                        )
+                        .await?
+                        {
+                            emit_decision_trace(
+                                app.as_ref(),
+                                decision_id_seq,
+                                DecisionWinnerLayer::AdaptiveScheduler,
+                                "adaptive_upgrade_probe",
+                                Some(target),
+                                Vec::new(),
+                                format!(
+                                    "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                    primary_score,
+                                    candidate_score,
+                                    adaptive_upgrade_streak,
+                                    required_windows
+                                ),
+                            );
+                            maintenance.refresh_after_cutover(
+                                config,
+                                app.as_ref(),
+                                ActiveTransport {
+                                    continuity,
+                                    power_runtime: &mut power_runtime,
+                                    transport: &mut transport,
+                                    io: &mut io,
+                                },
+                                &mut mobility_tracker,
+                                &candidate_welcome,
+                            );
+                            purge_old_migrations(&mut migration_history, Instant::now());
+                            migration_history.push_back(Instant::now());
+                            adaptive_upgrade_streak = 0;
+                            decision_id_seq = decision_id_seq.saturating_add(1);
+                            continue;
+                        }
+                    } else {
+                        emit_decision_trace(
+                            app.as_ref(),
+                            decision_id_seq,
+                            DecisionWinnerLayer::AdaptiveScheduler,
+                            "hysteresis_wait",
+                            Some(target),
+                            Vec::new(),
+                            format!(
+                                "score_primary={:.2} score_candidate={:.2} streak={} required={}",
+                                primary_score,
+                                candidate_score,
+                                adaptive_upgrade_streak,
+                                required_windows
+                            ),
+                        );
+                    }
+                }
+                // A slow attempt must not leave the next deadline in the past.
+                // Keep the existing interval/backoff, measured from completion.
+                maintenance.upgrade_probe_runtime.note_probe_failure(
+                    config,
+                    app.as_ref(),
+                    &power_runtime,
+                    Instant::now(),
+                    mobility_mode,
+                );
+            } else {
+                maintenance.upgrade_probe_runtime.note_probe_skip(
+                    config,
+                    app.as_ref(),
+                    &power_runtime,
+                    now,
+                    mobility_mode,
+                );
+            }
+        }
+        // Connecting or guarding a candidate may have taken time. Compute the
+        // idle receive deadline from completion, not from the pre-probe sample.
+        let now = Instant::now();
+        let mobility_mode = mobility_tracker.in_mode(now);
         let recv_timeout_ms = next_recv_timeout_ms(
             config,
             &maintenance.upgrade_probe_runtime,
@@ -1122,164 +1301,6 @@ async fn run_client_session_once(
                     let now = Instant::now();
                     health_tracker.note_timeout();
                     mobility_tracker.note_timeout(now);
-                    if maintenance
-                        .upgrade_probe_runtime
-                        .should_probe(config, now, mobility_mode)
-                    {
-                        if continuity.can_switch_without_loss() {
-                            let policy_input = if config.policy.scheduler_v2_enabled {
-                                app.scheduler_policy()
-                            } else {
-                                PolicyInput::default()
-                            };
-                            let probe_started_at = Instant::now();
-                            let probe_candidate =
-                                probe_higher_priority_transport(config, transport, &policy_input)
-                                    .await;
-                            if let Some((target, candidate_io)) = probe_candidate {
-                                let candidate_connect_elapsed_ms = duration_ms(
-                                    Instant::now().saturating_duration_since(probe_started_at),
-                                );
-                                let primary_snapshot = health_tracker.snapshot(now);
-                                let candidate_snapshot = warp_link_core::TransportHealthSnapshot {
-                                    timeout_rate: Some(0.0),
-                                    ack_non_ok_ratio: Some(0.0),
-                                    dead_air_secs: Some(0),
-                                    rtt_ewma_ms: Some(candidate_connect_elapsed_ms),
-                                    rtt_jitter_ms: Some(0),
-                                };
-                                let gate_ok = health_gate_passes(&config.policy, &primary_snapshot)
-                                    && health_gate_passes(&config.policy, &candidate_snapshot);
-                                let primary_score =
-                                    combined_score(transport, None, &primary_snapshot);
-                                let candidate_score = combined_score(
-                                    target,
-                                    Some(candidate_connect_elapsed_ms),
-                                    &candidate_snapshot,
-                                );
-                                let required_margin = 1.0
-                                    + (f64::from(config.policy.scheduler_hysteresis_percent)
-                                        / 100.0);
-                                let beats =
-                                    gate_ok && candidate_score >= (primary_score * required_margin);
-                                if beats {
-                                    adaptive_upgrade_streak =
-                                        adaptive_upgrade_streak.saturating_add(1);
-                                } else {
-                                    adaptive_upgrade_streak = 0;
-                                }
-                                let required_windows =
-                                    required_upgrade_windows(&config.policy, mobility_mode);
-                                if adaptive_upgrade_streak >= required_windows {
-                                    if migration_blocked_by_cooldown(
-                                        &mut migration_history,
-                                        &mut migration_cooldown_until,
-                                        now,
-                                        &config.policy,
-                                    ) {
-                                        emit_decision_trace(
-                                            app.as_ref(),
-                                            decision_id_seq,
-                                            DecisionWinnerLayer::AdaptiveScheduler,
-                                            "migration_cooldown_active",
-                                            Some(target),
-                                            Vec::new(),
-                                            format!(
-                                                "score_primary={:.2} score_candidate={:.2} streak={} required={}",
-                                                primary_score,
-                                                candidate_score,
-                                                adaptive_upgrade_streak,
-                                                required_windows
-                                            ),
-                                        );
-                                        adaptive_upgrade_streak = 0;
-                                    } else if let Some(candidate_welcome) =
-                                        commit_candidate_cutover(
-                                            config,
-                                            Arc::clone(&app),
-                                            ActiveTransport {
-                                                continuity,
-                                                power_runtime: &mut power_runtime,
-                                                transport: &mut transport,
-                                                io: &mut io,
-                                            },
-                                            target,
-                                            candidate_io,
-                                            decision_id_seq,
-                                        )
-                                        .await?
-                                    {
-                                        emit_decision_trace(
-                                            app.as_ref(),
-                                            decision_id_seq,
-                                            DecisionWinnerLayer::AdaptiveScheduler,
-                                            "adaptive_upgrade_probe",
-                                            Some(target),
-                                            Vec::new(),
-                                            format!(
-                                                "score_primary={:.2} score_candidate={:.2} streak={} required={}",
-                                                primary_score,
-                                                candidate_score,
-                                                adaptive_upgrade_streak,
-                                                required_windows
-                                            ),
-                                        );
-                                        maintenance.refresh_after_cutover(
-                                            config,
-                                            app.as_ref(),
-                                            ActiveTransport {
-                                                continuity,
-                                                power_runtime: &mut power_runtime,
-                                                transport: &mut transport,
-                                                io: &mut io,
-                                            },
-                                            &mut mobility_tracker,
-                                            &candidate_welcome,
-                                        );
-                                        purge_old_migrations(
-                                            &mut migration_history,
-                                            Instant::now(),
-                                        );
-                                        migration_history.push_back(Instant::now());
-                                        adaptive_upgrade_streak = 0;
-                                        decision_id_seq = decision_id_seq.saturating_add(1);
-                                        continue;
-                                    }
-                                } else {
-                                    emit_decision_trace(
-                                        app.as_ref(),
-                                        decision_id_seq,
-                                        DecisionWinnerLayer::AdaptiveScheduler,
-                                        "hysteresis_wait",
-                                        Some(target),
-                                        Vec::new(),
-                                        format!(
-                                            "score_primary={:.2} score_candidate={:.2} streak={} required={}",
-                                            primary_score,
-                                            candidate_score,
-                                            adaptive_upgrade_streak,
-                                            required_windows
-                                        ),
-                                    );
-                                }
-                            }
-                            maintenance.upgrade_probe_runtime.note_probe_failure(
-                                config,
-                                app.as_ref(),
-                                &power_runtime,
-                                now,
-                                mobility_mode,
-                            );
-                        } else {
-                            maintenance.upgrade_probe_runtime.note_probe_skip(
-                                config,
-                                app.as_ref(),
-                                &power_runtime,
-                                now,
-                                mobility_mode,
-                            );
-                        }
-                    }
 
                     if now.saturating_duration_since(maintenance.last_idle_ping_at)
                         >= Duration::from_millis(maintenance.idle_timeout_ms)
@@ -4650,3 +4671,6 @@ mod cutover_simplification_tests;
 
 #[cfg(all(test, feature = "wss"))]
 mod probe_simplification_tests;
+
+#[cfg(all(test, feature = "tcp", feature = "wss"))]
+mod session_probe_tests;
