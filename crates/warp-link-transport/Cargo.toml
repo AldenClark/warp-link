@@ -33,3 +33,6 @@ tokio-rustls = { workspace = true, features = ["ring"] }
 quinn = { workspace = true, features = ["rustls-aws-lc-rs"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring"] }

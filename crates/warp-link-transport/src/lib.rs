@@ -346,6 +346,17 @@ pub async fn connect_quic(config: &ClientConfig) -> Result<ClientIo, WarpLinkErr
 }
 
 pub async fn connect_tcp(config: &ClientConfig) -> Result<ClientIo, WarpLinkError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    connect_tcp_with_roots(config, roots).await
+}
+
+// Private seam: production always supplies the built-in roots above. Unit tests can
+// exercise this same socket/verification path with an isolated synthetic CA.
+async fn connect_tcp_with_roots(
+    config: &ClientConfig,
+    roots: rustls::RootCertStore,
+) -> Result<ClientIo, WarpLinkError> {
     let connect_timeout = Duration::from_millis(config.policy.connect_timeout_ms.max(1));
     let deadline = tokio::time::Instant::now() + connect_timeout;
     let addrs = timeout(
@@ -373,8 +384,6 @@ pub async fn connect_tcp(config: &ClientConfig) -> Result<ClientIo, WarpLinkErro
         .set_nodelay(true)
         .map_err(|e| WarpLinkError::Transport(e.to_string()))?;
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -1120,3 +1129,6 @@ mod tests {
         assert_eq!(url_host("gateway.example"), "gateway.example");
     }
 }
+
+#[cfg(test)]
+mod tcp_tls_tests;
