@@ -990,7 +990,24 @@ async fn run_connected_client_session(
                         vec![transport],
                         policy_inputs_digest(&policy_input),
                     );
-                    if let Some(candidate_io) = connect_transport(config, target).await.ok()
+                    if let Some(candidate_io) = drive_primary_during_connect(
+                        config,
+                        Arc::clone(&app),
+                        transport,
+                        PrimaryFrameState {
+                            continuity,
+                            power_runtime: &mut power_runtime,
+                            io: &mut io,
+                            pending_ping_sent_at: &mut pending_ping_sent_at,
+                            pending_ping_source: &mut pending_ping_source,
+                            health_tracker: &mut health_tracker,
+                            mobility_tracker: &mut mobility_tracker,
+                        },
+                        &mut maintenance,
+                        async { connect_transport(config, target).await.ok() },
+                        policy_input.control_epoch,
+                    )
+                    .await?
                         && let Some(candidate_welcome) = commit_candidate_cutover(
                             config,
                             Arc::clone(&app),
@@ -1050,8 +1067,24 @@ async fn run_connected_client_session(
                     PolicyInput::default()
                 };
                 let probe_started_at = Instant::now();
-                let probe_candidate =
-                    probe_higher_priority_transport(config, transport, &policy_input).await;
+                let probe_candidate = drive_primary_during_connect(
+                    config,
+                    Arc::clone(&app),
+                    transport,
+                    PrimaryFrameState {
+                        continuity,
+                        power_runtime: &mut power_runtime,
+                        io: &mut io,
+                        pending_ping_sent_at: &mut pending_ping_sent_at,
+                        pending_ping_source: &mut pending_ping_source,
+                        health_tracker: &mut health_tracker,
+                        mobility_tracker: &mut mobility_tracker,
+                    },
+                    &mut maintenance,
+                    probe_higher_priority_transport(config, transport, &policy_input),
+                    policy_input.control_epoch,
+                )
+                .await?;
                 if let Some((target, candidate_io)) = probe_candidate {
                     let candidate_connect_elapsed_ms =
                         duration_ms(Instant::now().saturating_duration_since(probe_started_at));
@@ -1251,7 +1284,24 @@ async fn run_connected_client_session(
                             vec![transport],
                             policy_inputs_digest(&policy_input),
                         );
-                        if let Some(candidate_io) = connect_transport(config, target).await.ok()
+                        if let Some(candidate_io) = drive_primary_during_connect(
+                            config,
+                            Arc::clone(&app),
+                            transport,
+                            PrimaryFrameState {
+                                continuity,
+                                power_runtime: &mut power_runtime,
+                                io: &mut io,
+                                pending_ping_sent_at: &mut pending_ping_sent_at,
+                                pending_ping_source: &mut pending_ping_source,
+                                health_tracker: &mut health_tracker,
+                                mobility_tracker: &mut mobility_tracker,
+                            },
+                            &mut maintenance,
+                            async { connect_transport(config, target).await.ok() },
+                            policy_input.control_epoch,
+                        )
+                        .await?
                             && let Some(candidate_welcome) = commit_candidate_cutover(
                                 config,
                                 Arc::clone(&app),
@@ -1330,9 +1380,24 @@ async fn run_connected_client_session(
                                 } else {
                                     PolicyInput::default()
                                 };
-                                let alternate =
-                                    probe_alternate_transport(config, transport, &policy_input)
-                                        .await;
+                                let alternate = drive_primary_during_connect(
+                                    config,
+                                    Arc::clone(&app),
+                                    transport,
+                                    PrimaryFrameState {
+                                        continuity,
+                                        power_runtime: &mut power_runtime,
+                                        io: &mut io,
+                                        pending_ping_sent_at: &mut pending_ping_sent_at,
+                                        pending_ping_source: &mut pending_ping_source,
+                                        health_tracker: &mut health_tracker,
+                                        mobility_tracker: &mut mobility_tracker,
+                                    },
+                                    &mut maintenance,
+                                    probe_alternate_transport(config, transport, &policy_input),
+                                    policy_input.control_epoch,
+                                )
+                                .await?;
                                 if let Some((target, candidate_io)) = alternate
                                     && let Some(candidate_welcome) = commit_candidate_cutover(
                                         config,
@@ -1414,6 +1479,98 @@ async fn run_connected_client_session(
             },
         )
         .await?;
+    }
+}
+
+// A connection attempt does not yet own a HELLO/session. Keep the established
+// primary's single receive/save/ACK owner running until connect/TLS completes.
+// Candidate HELLO/WELCOME/commit retain their separate existing contract.
+async fn drive_primary_during_connect<T>(
+    config: &ClientConfig,
+    app: Arc<dyn ClientApp>,
+    transport: TransportKind,
+    state: PrimaryFrameState<'_>,
+    maintenance: &mut SessionMaintenance,
+    connecting: impl Future<Output = T>,
+    observed_control_epoch: u64,
+) -> Result<T, WarpLinkError> {
+    if config.policy.scheduler_v2_enabled
+        && app.scheduler_policy().control_epoch != observed_control_epoch
+    {
+        return Err(WarpLinkError::Reconnect(
+            "control changed before candidate connect".into(),
+        ));
+    }
+    tokio::pin!(connecting);
+    let PrimaryFrameState {
+        continuity,
+        power_runtime,
+        io,
+        pending_ping_sent_at,
+        pending_ping_source,
+        health_tracker,
+        mobility_tracker,
+    } = state;
+    loop {
+        let elapsed = Instant::now().saturating_duration_since(maintenance.last_idle_ping_at);
+        let remaining = maintenance
+            .idle_timeout_ms
+            .saturating_sub(duration_ms(elapsed))
+            .max(1);
+        // Stream FramedReader retains partial prefix/payload state; tungstenite
+        // retains parsing state in the owned ClientIo. Dropping this read future
+        // therefore leaves the still-active socket's partial frame recoverable.
+        let frame = tokio::select! {
+            biased;
+            _ = app.wait_for_control_change(observed_control_epoch), if config.policy.scheduler_v2_enabled => {
+                return Err(WarpLinkError::Reconnect("control changed during candidate connect".into()));
+            }
+            result = &mut connecting => return Ok(result),
+            frame = io.recv_frame(remaining) => frame,
+        };
+        match frame {
+            Ok(frame) => {
+                maintenance.idle_timeout_streak = 0;
+                maintenance.last_idle_ping_at = Instant::now();
+                health_tracker.note_frame_progress(Instant::now());
+                handle_primary_frame(
+                    config,
+                    Arc::clone(&app),
+                    transport,
+                    frame,
+                    PrimaryFrameState {
+                        continuity,
+                        power_runtime,
+                        io,
+                        pending_ping_sent_at,
+                        pending_ping_source,
+                        health_tracker,
+                        mobility_tracker,
+                    },
+                )
+                .await?;
+            }
+            Err(WarpLinkError::Timeout(_)) => {
+                let now = Instant::now();
+                health_tracker.note_timeout();
+                mobility_tracker.note_timeout(now);
+                maintenance.idle_timeout_streak = maintenance.idle_timeout_streak.saturating_add(1);
+                if maintenance.idle_timeout_streak >= 4 {
+                    return Err(WarpLinkError::Timeout("idle timeout".into()));
+                }
+                io.send_frame(
+                    &config.wire_profile.encode_client_ping(),
+                    config.policy.write_timeout_ms,
+                )
+                .await?;
+                maintenance.last_idle_ping_at = now;
+                if pending_ping_sent_at.is_none() {
+                    *pending_ping_sent_at = Some(now);
+                    *pending_ping_source = Some(ProbeRttSource::IdleKeepalive);
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
