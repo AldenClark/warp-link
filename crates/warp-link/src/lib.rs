@@ -2659,6 +2659,11 @@ pub async fn run_server_session(
         };
         let mut session = match connect_auth {
             Ok(AuthResponse::ConnectAccepted(session)) => session,
+            Ok(AuthResponse::SessionUpdated(_)) => {
+                let error = WarpLinkError::Protocol("session update before connect".into());
+                app.on_handshake_failure(peer.clone(), &error).await;
+                return Err(error);
+            }
             Ok(AuthResponse::State(state)) => {
                 let public_message = public_auth_state_message(&state);
                 let reason = apply_auth_state_to_reason(state)
@@ -2745,21 +2750,7 @@ pub async fn run_server_session(
                 .metadata
                 .insert("coord_epoch".to_string(), lease.epoch.to_string());
         }
-        let welcome = warp_link_core::WelcomeMsg {
-            session_id: session.session_id.clone(),
-            identity: session.identity.clone(),
-            resume_token: session.resume_token.clone(),
-            heartbeat_secs: session.heartbeat_secs,
-            ping_interval_secs: session.ping_interval_secs,
-            idle_timeout_secs: session.idle_timeout_secs,
-            max_backoff_secs: session.max_backoff_secs,
-            auth_expires_at_unix_secs: session.auth_expires_at_unix_secs,
-            auth_refresh_before_secs: session.auth_refresh_before_secs,
-            max_frame_bytes: session.max_frame_bytes,
-            negotiated_wire_version: session.negotiated_wire_version,
-            negotiated_payload_version: session.negotiated_payload_version,
-            metadata: session.metadata.clone(),
-        };
+        let welcome = session_welcome(&session);
         let welcome_frame = match profile.encode_server_welcome(&welcome) {
             Ok(frame) => frame,
             Err(err) => {
@@ -2854,7 +2845,7 @@ pub async fn run_server_session(
                     .await
                 {
                     Ok(AuthResponse::State(state)) => state,
-                    Ok(AuthResponse::ConnectAccepted(_)) => {
+                    Ok(AuthResponse::ConnectAccepted(_) | AuthResponse::SessionUpdated(_)) => {
                         SessionAuthState::RefreshRequired("invalid_refresh_response".to_string())
                     }
                     Err(AuthError::Unauthorized(reason)) => SessionAuthState::Revoked(reason),
@@ -2956,6 +2947,29 @@ pub async fn run_server_session(
                                         .await;
                                     let state = match state {
                                         Ok(AuthResponse::State(state)) => state,
+                                        Ok(AuthResponse::SessionUpdated(updated)) => {
+                                            // The authentication owner establishes the outbound
+                                            // boundary; this same socket writer emits its receipt
+                                            // before another wait_outbound can be polled.
+                                            if updated.session_id != session.session_id
+                                                || updated.identity != session.identity
+                                                || updated.negotiated_wire_version != session.negotiated_wire_version
+                                                || updated.negotiated_payload_version != session.negotiated_payload_version
+                                            {
+                                                let reason = auth_goaway_reason("auth_reauth_failed", "session_update_mismatch");
+                                                send_goaway_and_close(io, profile.as_ref(), &app, &session, reason).await;
+                                                return Ok(());
+                                            }
+                                            session = updated;
+                                            session.max_frame_bytes = session.max_frame_bytes.clamp(2, TRANSPORT_MAX_FRAME_BYTES);
+                                            auth_schedule = AuthSchedule::from_session(&session);
+                                            let receipt = profile.encode_server_welcome(&session_welcome(&session))?;
+                                            if let Err(error) = io.send_frame(&receipt).await {
+                                                app.on_disconnect(&session, DisconnectReason::TransportError(error.to_string())).await;
+                                                return Err(error);
+                                            }
+                                            continue;
+                                        }
                                         Ok(AuthResponse::ConnectAccepted(_)) => {
                                             SessionAuthState::RefreshRequired("invalid_reauth_response".to_string())
                                         }
@@ -3010,6 +3024,24 @@ pub async fn run_server_session(
         (Err(error), _) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
         (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+fn session_welcome(session: &warp_link_core::SessionCtx) -> warp_link_core::WelcomeMsg {
+    warp_link_core::WelcomeMsg {
+        session_id: session.session_id.clone(),
+        identity: session.identity.clone(),
+        resume_token: session.resume_token.clone(),
+        heartbeat_secs: session.heartbeat_secs,
+        ping_interval_secs: session.ping_interval_secs,
+        idle_timeout_secs: session.idle_timeout_secs,
+        max_backoff_secs: session.max_backoff_secs,
+        auth_expires_at_unix_secs: session.auth_expires_at_unix_secs,
+        auth_refresh_before_secs: session.auth_refresh_before_secs,
+        max_frame_bytes: session.max_frame_bytes,
+        negotiated_wire_version: session.negotiated_wire_version,
+        negotiated_payload_version: session.negotiated_payload_version,
+        metadata: session.metadata.clone(),
     }
 }
 

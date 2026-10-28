@@ -4,7 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use warp_link_core::{
     AckMsg, AckStatus, DecodedClientFrame, DecodedServerFrame, DeliverMsg, HelloCtx,
-    MAX_FRAME_BYTES, WelcomeMsg, WireError, WireProfile,
+    MAX_FRAME_BYTES, WelcomeMsg, WireError, WireProfile, handoff,
 };
 
 pub const WIRE_CODEC_POSTCARD: u8 = 1;
@@ -12,6 +12,132 @@ pub const WIRE_VERSION_V2: u8 = 2;
 pub const PRIVATE_PAYLOAD_VERSION_V1: u8 = 1;
 pub const SUPPORTED_WIRE_VERSIONS: &[u8] = &[WIRE_VERSION_V2];
 pub const SUPPORTED_PAYLOAD_VERSIONS: &[u8] = &[PRIVATE_PAYLOAD_VERSION_V1];
+
+const HANDOFF_TAG: &[u8] = b"WLH\x01";
+const HANDOFF_MAX_BYTES: usize = 1024;
+const HANDOFF_MAX_ENTRIES: usize = 4;
+const HANDOFF_MAX_KEY_BYTES: usize = 32;
+const HANDOFF_MAX_VALUE_BYTES: usize = 160;
+
+fn is_handoff_key(key: &str) -> bool {
+    matches!(
+        key,
+        handoff::VERSION_KEY | handoff::PHASE_KEY | handoff::PEER_KEY | handoff::ID_KEY
+    )
+}
+
+/// Keep the legacy postcard prefix unchanged. Old Rust profiles deserialize
+/// that prefix and ignore the tail; a new peer must still explicitly confirm
+/// the capability before treating any preparation as a safe handoff.
+fn encode_handoff_frame(
+    frame_type: FrameType,
+    mut payload: Vec<u8>,
+    metadata: &BTreeMap<String, String>,
+) -> Result<Bytes, WireError> {
+    let selected: BTreeMap<&str, &str> = metadata
+        .iter()
+        .filter(|(key, _)| is_handoff_key(key))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    if !selected.is_empty() {
+        if selected.get(handoff::VERSION_KEY).copied() != Some(handoff::VERSION)
+            || selected.len() > HANDOFF_MAX_ENTRIES
+            || selected.iter().any(|(key, value)| {
+                key.len() > HANDOFF_MAX_KEY_BYTES || value.len() > HANDOFF_MAX_VALUE_BYTES
+            })
+        {
+            return Err(WireError::InvalidFrame(
+                "invalid handoff metadata".to_owned(),
+            ));
+        }
+        let tail =
+            postcard::to_allocvec(&selected).map_err(|e| WireError::Encode(e.to_string()))?;
+        if HANDOFF_TAG.len() + tail.len() > HANDOFF_MAX_BYTES {
+            return Err(WireError::InvalidFrame(
+                "handoff metadata exceeds limit".to_owned(),
+            ));
+        }
+        payload.extend_from_slice(HANDOFF_TAG);
+        payload.extend_from_slice(&tail);
+    }
+    if payload.len() > MAX_FRAME_BYTES - 2 {
+        return Err(WireError::InvalidFrame(
+            "control frame exceeds limit".to_owned(),
+        ));
+    }
+    Ok(encode_frame(frame_type, postcard_v1_flags(), &payload))
+}
+
+struct HandoffMetadata(BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for HandoffMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BoundedMetadata;
+
+        impl<'de> serde::de::Visitor<'de> for BoundedMetadata {
+            type Value = HandoffMetadata;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("bounded handoff metadata")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+                if map
+                    .size_hint()
+                    .is_some_and(|size| size > HANDOFF_MAX_ENTRIES)
+                {
+                    return Err(A::Error::custom("too many handoff fields"));
+                }
+                let mut fields = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<&'de str, &'de str>()? {
+                    // Borrow strings from the already bounded tail until their
+                    // identity and size have been checked, then own at most 4.
+                    if fields.len() >= HANDOFF_MAX_ENTRIES
+                        || key.len() > HANDOFF_MAX_KEY_BYTES
+                        || value.len() > HANDOFF_MAX_VALUE_BYTES
+                        || !is_handoff_key(key)
+                        || fields.contains_key(key)
+                    {
+                        return Err(A::Error::custom("invalid handoff field"));
+                    }
+                    fields.insert(key.to_owned(), value.to_owned());
+                }
+                if fields.get(handoff::VERSION_KEY).map(String::as_str) != Some(handoff::VERSION) {
+                    return Err(A::Error::custom("unsupported handoff version"));
+                }
+                Ok(HandoffMetadata(fields))
+            }
+        }
+        deserializer.deserialize_map(BoundedMetadata)
+    }
+}
+
+fn decode_handoff_tail(tail: &[u8]) -> Result<BTreeMap<String, String>, WireError> {
+    if tail.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if tail.len() > HANDOFF_MAX_BYTES || !tail.starts_with(HANDOFF_TAG) {
+        return Err(WireError::InvalidFrame(
+            "invalid handoff metadata extension".to_owned(),
+        ));
+    }
+    let (metadata, remaining) =
+        postcard::take_from_bytes::<HandoffMetadata>(&tail[HANDOFF_TAG.len()..])
+            .map_err(|error| WireError::Decode(error.to_string()))?;
+    if !remaining.is_empty() {
+        return Err(WireError::InvalidFrame(
+            "trailing handoff metadata bytes".to_owned(),
+        ));
+    }
+    Ok(metadata.0)
+}
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,11 +255,7 @@ impl WireProfile for PushgoWireProfile {
             app_state: hello.app_state.clone(),
         })
         .map_err(|e| WireError::Encode(e.to_string()))?;
-        Ok(encode_frame(
-            FrameType::ClientHello,
-            postcard_v1_flags(),
-            &payload,
-        ))
+        encode_handoff_frame(FrameType::ClientHello, payload, &hello.metadata)
     }
 
     fn decode_server_frame(&self, frame: &[u8]) -> Result<DecodedServerFrame, WireError> {
@@ -141,8 +263,9 @@ impl WireProfile for PushgoWireProfile {
         validate_wire_flags(flags)?;
         match ty {
             FrameType::ServerWelcome => {
-                let welcome: ServerWelcomeWire =
-                    postcard::from_bytes(payload).map_err(|e| WireError::Decode(e.to_string()))?;
+                let (welcome, tail): (ServerWelcomeWire, _) = postcard::take_from_bytes(payload)
+                    .map_err(|e| WireError::Decode(e.to_string()))?;
+                let metadata = decode_handoff_tail(tail)?;
                 Ok(DecodedServerFrame::Welcome(WelcomeMsg {
                     session_id: welcome.session_id,
                     identity: String::new(),
@@ -156,7 +279,7 @@ impl WireProfile for PushgoWireProfile {
                     max_frame_bytes: welcome.max_frame_bytes,
                     negotiated_wire_version: welcome.negotiated_wire_version,
                     negotiated_payload_version: welcome.negotiated_payload_version,
-                    metadata: BTreeMap::new(),
+                    metadata,
                 }))
             }
             FrameType::Deliver => {
@@ -218,8 +341,9 @@ impl WireProfile for PushgoWireProfile {
         validate_wire_flags(flags)?;
         match ty {
             FrameType::ClientHello => {
-                let hello: ClientHelloWire =
-                    postcard::from_bytes(payload).map_err(|e| WireError::Decode(e.to_string()))?;
+                let (hello, tail): (ClientHelloWire, _) = postcard::take_from_bytes(payload)
+                    .map_err(|e| WireError::Decode(e.to_string()))?;
+                let metadata = decode_handoff_tail(tail)?;
                 Ok(DecodedClientFrame::Hello(HelloCtx {
                     identity: hello.device_key,
                     auth_token: hello.gateway_token,
@@ -233,7 +357,7 @@ impl WireProfile for PushgoWireProfile {
                     ),
                     perf_tier: hello.perf_tier,
                     app_state: hello.app_state,
-                    metadata: BTreeMap::new(),
+                    metadata,
                 }))
             }
             FrameType::Ack => {
@@ -279,11 +403,7 @@ impl WireProfile for PushgoWireProfile {
             negotiated_payload_version: welcome.negotiated_payload_version,
         })
         .map_err(|e| WireError::Encode(e.to_string()))?;
-        Ok(encode_frame(
-            FrameType::ServerWelcome,
-            postcard_v1_flags(),
-            &payload,
-        ))
+        encode_handoff_frame(FrameType::ServerWelcome, payload, &welcome.metadata)
     }
 
     fn encode_server_deliver(&self, msg: &DeliverMsg) -> Result<Bytes, WireError> {
@@ -546,6 +666,166 @@ mod tests {
                 assert_eq!(decoded.status, AckStatus::InvalidPayload);
             }
             other => panic!("unexpected decoded frame: {other:?}"),
+        }
+    }
+
+    fn handoff_metadata(phase: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (handoff::VERSION_KEY.to_owned(), handoff::VERSION.to_owned()),
+            (handoff::PHASE_KEY.to_owned(), phase.to_owned()),
+            (handoff::PEER_KEY.to_owned(), "source-session".to_owned()),
+            (handoff::ID_KEY.to_owned(), "transfer-id".to_owned()),
+        ])
+    }
+
+    fn sample_welcome() -> WelcomeMsg {
+        WelcomeMsg {
+            session_id: "candidate-session".to_owned(),
+            identity: "device".to_owned(),
+            resume_token: Some("resume".to_owned()),
+            heartbeat_secs: 30,
+            ping_interval_secs: 30,
+            idle_timeout_secs: 90,
+            max_backoff_secs: 60,
+            auth_expires_at_unix_secs: None,
+            auth_refresh_before_secs: 0,
+            max_frame_bytes: MAX_FRAME_BYTES as u32,
+            negotiated_wire_version: WIRE_VERSION_V2,
+            negotiated_payload_version: PRIVATE_PAYLOAD_VERSION_V1,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn handoff_hello_preserves_legacy_prefix_and_roundtrips_bounded_metadata() {
+        let profile = PushgoWireProfile;
+        let mut hello = HelloCtx {
+            identity: "device".to_owned(),
+            last_acked_seq: Some(9),
+            resume_token: Some("resume".to_owned()),
+            ..HelloCtx::default()
+        };
+        let legacy = profile.encode_client_hello(&hello).unwrap();
+        hello.metadata = handoff_metadata("prepare");
+        let extended = profile.encode_client_hello(&hello).unwrap();
+        assert!(extended.starts_with(&legacy));
+        assert!(extended[legacy.len()..].starts_with(HANDOFF_TAG));
+        // Exact behavior of the previously used Rust decoder, not an inference
+        // that every unrelated non-Rust decoder also accepts a trailing field.
+        let old: ClientHelloWire = postcard::from_bytes(&extended[2..]).unwrap();
+        assert_eq!(old.device_key, hello.identity);
+        assert_eq!(old.last_acked_seq, Some(9));
+        let DecodedClientFrame::Hello(decoded) = profile.decode_client_frame(&extended).unwrap()
+        else {
+            panic!("expected extended HELLO");
+        };
+        assert_eq!(decoded.metadata, hello.metadata);
+        let DecodedClientFrame::Hello(decoded_legacy) =
+            profile.decode_client_frame(&legacy).unwrap()
+        else {
+            panic!("expected old HELLO");
+        };
+        assert!(decoded_legacy.metadata.is_empty());
+    }
+
+    #[test]
+    fn handoff_welcome_preserves_legacy_prefix_and_no_capability_is_not_confirmation() {
+        let profile = PushgoWireProfile;
+        let mut welcome = sample_welcome();
+        let legacy = profile.encode_server_welcome(&welcome).unwrap();
+        welcome.metadata = handoff_metadata("prepared");
+        let extended = profile.encode_server_welcome(&welcome).unwrap();
+        assert!(extended.starts_with(&legacy));
+        let old: ServerWelcomeWire = postcard::from_bytes(&extended[2..]).unwrap();
+        assert_eq!(old.session_id, welcome.session_id);
+        assert_eq!(old.max_frame_bytes, MAX_FRAME_BYTES as u32);
+        let DecodedServerFrame::Welcome(decoded) = profile.decode_server_frame(&extended).unwrap()
+        else {
+            panic!("expected extended WELCOME");
+        };
+        assert_eq!(decoded.metadata, welcome.metadata);
+        let DecodedServerFrame::Welcome(decoded_legacy) =
+            profile.decode_server_frame(&legacy).unwrap()
+        else {
+            panic!("expected old WELCOME");
+        };
+        assert!(decoded_legacy.metadata.is_empty());
+    }
+
+    #[test]
+    fn handoff_encoding_ignores_unrelated_metadata_and_bounds_control_frames() {
+        let profile = PushgoWireProfile;
+        let mut hello = HelloCtx::default();
+        let normal = profile.encode_client_hello(&hello).unwrap();
+        hello
+            .metadata
+            .insert("unrelated".to_owned(), "not-on-wire".to_owned());
+        assert_eq!(profile.encode_client_hello(&hello).unwrap(), normal);
+        hello.metadata = handoff_metadata("prepare");
+        hello
+            .metadata
+            .insert(handoff::PEER_KEY.to_owned(), "s".repeat(161));
+        assert!(profile.encode_client_hello(&hello).is_err());
+        hello.metadata = handoff_metadata("prepare");
+        hello.metadata.remove(handoff::VERSION_KEY);
+        assert!(profile.encode_client_hello(&hello).is_err());
+        hello.metadata = BTreeMap::new();
+        hello.identity = "x".repeat(MAX_FRAME_BYTES);
+        assert!(profile.encode_client_hello(&hello).is_err());
+        let mut welcome = sample_welcome();
+        welcome.session_id = "x".repeat(MAX_FRAME_BYTES);
+        assert!(profile.encode_server_welcome(&welcome).is_err());
+    }
+
+    #[test]
+    fn handoff_decode_rejects_unknown_duplicate_oversized_and_truncated_tails() {
+        let profile = PushgoWireProfile;
+        let hello = profile.encode_client_hello(&HelloCtx::default()).unwrap();
+        let welcome = profile.encode_server_welcome(&sample_welcome()).unwrap();
+        let valid = postcard::to_allocvec(&handoff_metadata("prepared")).unwrap();
+        let mut over_value = handoff_metadata("prepared");
+        over_value.insert(handoff::PEER_KEY.to_owned(), "x".repeat(161));
+        let mut unknown = BTreeMap::from([(handoff::VERSION_KEY, handoff::VERSION)]);
+        unknown.insert("unknown", "value");
+        let fifth = BTreeMap::from([
+            (handoff::VERSION_KEY, handoff::VERSION),
+            (handoff::PHASE_KEY, "prepared"),
+            (handoff::PEER_KEY, "old"),
+            (handoff::ID_KEY, "id"),
+            ("fifth", "no"),
+        ]);
+        let duplicate = [
+            (handoff::VERSION_KEY, handoff::VERSION),
+            (handoff::VERSION_KEY, handoff::VERSION),
+        ];
+        let bad_payloads = [
+            postcard::to_allocvec(&over_value).unwrap(),
+            postcard::to_allocvec(&unknown).unwrap(),
+            postcard::to_allocvec(&fifth).unwrap(),
+            postcard::to_allocvec(&duplicate.to_vec()).unwrap(),
+            postcard::to_allocvec(&BTreeMap::from([(handoff::VERSION_KEY, "2")])).unwrap(),
+            valid[..valid.len() - 1].to_vec(),
+            [valid.as_slice(), &[0]].concat(),
+        ];
+        for base in [&hello, &welcome] {
+            for bad in &bad_payloads {
+                let bytes = [base.as_ref(), HANDOFF_TAG, bad.as_slice()].concat();
+                let result = if base[0] == FrameType::ClientHello as u8 {
+                    profile.decode_client_frame(&bytes).map(|_| ())
+                } else {
+                    profile.decode_server_frame(&bytes).map(|_| ())
+                };
+                assert!(result.is_err());
+            }
+            for tail in [b"WLH\x02".as_slice(), &[0], &[0; HANDOFF_MAX_BYTES + 1]] {
+                let bytes = [base.as_ref(), tail].concat();
+                let result = if base[0] == FrameType::ClientHello as u8 {
+                    profile.decode_client_frame(&bytes).map(|_| ())
+                } else {
+                    profile.decode_server_frame(&bytes).map(|_| ())
+                };
+                assert!(result.is_err());
+            }
         }
     }
 

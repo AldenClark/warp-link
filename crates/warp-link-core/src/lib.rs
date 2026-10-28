@@ -12,6 +12,16 @@ use bytes::Bytes;
 /// Readers validate the declared length before allocating a payload buffer.
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 
+/// Negotiated, bounded ownership transfer on the existing HELLO/WELCOME frames.
+/// A capability offer alone does not grant a candidate delivery ownership.
+pub mod handoff {
+    pub const VERSION_KEY: &str = "wl_handoff";
+    pub const VERSION: &str = "1";
+    pub const PHASE_KEY: &str = "wl_handoff_phase";
+    pub const PEER_KEY: &str = "wl_handoff_peer";
+    pub const ID_KEY: &str = "wl_handoff_id";
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     Quic,
@@ -390,6 +400,10 @@ pub struct AuthRequest {
 #[derive(Debug, Clone)]
 pub enum AuthResponse {
     ConnectAccepted(SessionCtx),
+    /// A validated `InBandReauth` update of the existing session. The server emits a
+    /// WELCOME on that session's ordered stream before handing off more work.
+    /// This is not another connection or an application delivery acknowledgement.
+    SessionUpdated(SessionCtx),
     State(SessionAuthState),
 }
 
