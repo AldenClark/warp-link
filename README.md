@@ -54,6 +54,21 @@ source identity, and downstream adoption limits.
 
 ## Verification
 
+Private delivery completion requires an explicit ACK identifying the delivery
+and its issued sequence. `last_acked_seq` remains a legacy field, not proof
+that every lower sequence was persisted; new clients clear that hint even when
+an application supplies a stored maximum. ACK loss can therefore replay a
+delivery and requires the application's existing durable idempotency.
+
+Loss-safe hot handoff requires both peers to negotiate `wl_handoff=1` on the
+existing HELLO/WELCOME frames. A prepared candidate has no business outbound
+ownership. The primary continues processing while its candidate awaits WELCOME
+and the health guard; an ordered old-stream freeze/drain receipt and explicit
+ACK fence precede candidate activation. Only confirmed activation changes the
+client owner. Missing capability leaves normal connections, recovery and
+transport probes available, but does not permit an unconfirmed hot switch.
+Preparation is bounded and unacknowledged work remains replayable after failure.
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

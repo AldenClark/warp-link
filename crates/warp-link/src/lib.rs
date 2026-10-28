@@ -65,12 +65,17 @@ use warp_link_transport::{FramedReader, write_prefixed_frame};
 pub use warp_link_core;
 pub use warp_link_transport;
 
+mod handoff_client;
+use handoff_client::commit_candidate_cutover;
+
 const TRANSPORT_MAX_FRAME_BYTES: u32 = warp_link_core::MAX_FRAME_BYTES as u32;
 
 #[derive(Default)]
 struct ClientContinuityState {
     resume_token: Option<String>,
     last_acked_seq: Option<u64>,
+    handoff_session: Option<String>,
+    handoff_supported: bool,
 }
 
 impl ClientContinuityState {
@@ -78,9 +83,21 @@ impl ClientContinuityState {
         if let Some(resume_token) = self.resume_token.as_ref() {
             hello.resume_token = Some(resume_token.clone());
         }
-        if let Some(seq) = self.last_acked_seq {
-            hello.last_acked_seq = Some(hello.last_acked_seq.unwrap_or(seq).max(seq));
+        // A maximum successful sequence is not cumulative persistence proof.
+        // Clear even an application's persisted hint before contacting an old
+        // server, which might otherwise infer ACKs for unprocessed lower IDs.
+        hello.last_acked_seq = None;
+        for key in [
+            warp_link_core::handoff::PHASE_KEY,
+            warp_link_core::handoff::PEER_KEY,
+            warp_link_core::handoff::ID_KEY,
+        ] {
+            hello.metadata.remove(key);
         }
+        hello.metadata.insert(
+            warp_link_core::handoff::VERSION_KEY.into(),
+            warp_link_core::handoff::VERSION.into(),
+        );
     }
 
     fn note_welcome(&mut self, resume_token: Option<&str>) {
@@ -89,6 +106,16 @@ impl ClientContinuityState {
         {
             self.resume_token = Some(value.to_string());
         }
+    }
+
+    fn note_session_welcome(&mut self, welcome: &warp_link_core::WelcomeMsg) {
+        self.note_welcome(welcome.resume_token.as_deref());
+        self.handoff_session = Some(welcome.session_id.clone());
+        self.handoff_supported = welcome
+            .metadata
+            .get(warp_link_core::handoff::VERSION_KEY)
+            .map(String::as_str)
+            == Some(warp_link_core::handoff::VERSION);
     }
 
     fn note_acked_seq(&mut self, seq: Option<u64>) {
@@ -909,7 +936,7 @@ async fn run_connected_client_session(
     let _ = app.on_event(ClientEvent::Welcome {
         welcome: welcome.clone(),
     });
-    continuity.note_welcome(welcome.resume_token.as_deref());
+    continuity.note_session_welcome(&welcome);
 
     let idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
     let idle_timeout_streak = 0u8;
@@ -1020,6 +1047,12 @@ async fn run_connected_client_session(
                             target,
                             candidate_io,
                             decision_id_seq,
+                            PrimaryProgress {
+                                pending_ping_sent_at: &mut pending_ping_sent_at,
+                                pending_ping_source: &mut pending_ping_source,
+                                health_tracker: &mut health_tracker,
+                                mobility_tracker: &mut mobility_tracker,
+                            },
                         )
                         .await?
                     {
@@ -1148,6 +1181,12 @@ async fn run_connected_client_session(
                             target,
                             candidate_io,
                             decision_id_seq,
+                            PrimaryProgress {
+                                pending_ping_sent_at: &mut pending_ping_sent_at,
+                                pending_ping_source: &mut pending_ping_source,
+                                health_tracker: &mut health_tracker,
+                                mobility_tracker: &mut mobility_tracker,
+                            },
                         )
                         .await?
                         {
@@ -1314,6 +1353,12 @@ async fn run_connected_client_session(
                                 target,
                                 candidate_io,
                                 decision_id_seq,
+                                PrimaryProgress {
+                                    pending_ping_sent_at: &mut pending_ping_sent_at,
+                                    pending_ping_source: &mut pending_ping_source,
+                                    health_tracker: &mut health_tracker,
+                                    mobility_tracker: &mut mobility_tracker,
+                                },
                             )
                             .await?
                         {
@@ -1411,6 +1456,12 @@ async fn run_connected_client_session(
                                         target,
                                         candidate_io,
                                         decision_id_seq,
+                                        PrimaryProgress {
+                                            pending_ping_sent_at: &mut pending_ping_sent_at,
+                                            pending_ping_source: &mut pending_ping_source,
+                                            health_tracker: &mut health_tracker,
+                                            mobility_tracker: &mut mobility_tracker,
+                                        },
                                     )
                                     .await?
                                 {
@@ -1630,6 +1681,13 @@ fn classify_primary_goaway(reason: String) -> WarpLinkError {
     }
 }
 
+struct PrimaryProgress<'a> {
+    pending_ping_sent_at: &'a mut Option<Instant>,
+    pending_ping_source: &'a mut Option<ProbeRttSource>,
+    health_tracker: &'a mut HealthTracker,
+    mobility_tracker: &'a mut MobilityTracker,
+}
+
 struct PrimaryFrameState<'a> {
     continuity: &'a mut ClientContinuityState,
     power_runtime: &'a mut ClientPowerRuntime,
@@ -1753,9 +1811,7 @@ impl SessionMaintenance {
         mobility_tracker: &mut MobilityTracker,
         welcome: &warp_link_core::WelcomeMsg,
     ) {
-        active
-            .continuity
-            .note_welcome(welcome.resume_token.as_deref());
+        active.continuity.note_session_welcome(welcome);
         self.idle_timeout_ms = u64::from(welcome.ping_interval_secs.clamp(5, 30)) * 1_000;
         self.idle_timeout_streak = 0;
         self.last_idle_ping_at = Instant::now();
@@ -1780,159 +1836,6 @@ struct ActiveTransport<'a> {
     power_runtime: &'a mut ClientPowerRuntime,
     transport: &'a mut TransportKind,
     io: &'a mut ClientIo,
-}
-
-async fn commit_candidate_cutover(
-    config: &ClientConfig,
-    app: Arc<dyn ClientApp>,
-    active: ActiveTransport<'_>,
-    target: TransportKind,
-    mut candidate_io: ClientIo,
-    decision_id: u64,
-) -> Result<Option<warp_link_core::WelcomeMsg>, WarpLinkError> {
-    let ActiveTransport {
-        continuity,
-        power_runtime,
-        transport,
-        io,
-    } = active;
-    let from_transport = *transport;
-    emit_scheduler_state(
-        app.as_ref(),
-        SchedulerState::CandidateConnecting,
-        "candidate_connecting",
-    );
-    let _ = app.on_event(ClientEvent::CandidateStarted {
-        from: from_transport,
-        to: target,
-        decision_id,
-    });
-    let candidate_welcome = match initialize_candidate_transport(
-        config,
-        app.as_ref(),
-        continuity,
-        power_runtime,
-        &mut candidate_io,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(_) => {
-            emit_scheduler_state(
-                app.as_ref(),
-                SchedulerState::PrimaryActive,
-                "candidate_failed_precommit",
-            );
-            return Ok(None);
-        }
-    };
-
-    emit_scheduler_state(
-        app.as_ref(),
-        SchedulerState::CutoverReady,
-        "candidate_ready",
-    );
-    let _ = app.on_event(ClientEvent::CandidateReady {
-        from: from_transport,
-        to: target,
-        decision_id,
-    });
-    let old_io = std::mem::replace(io, candidate_io);
-    *transport = target;
-    emit_scheduler_state(
-        app.as_ref(),
-        SchedulerState::DrainingOld,
-        "cutover_committed",
-    );
-    let _ = app.on_event(ClientEvent::CutoverCommitted {
-        from: from_transport,
-        to: target,
-        decision_id,
-    });
-
-    if let Err(err) = cutover_guard(config, Arc::clone(&app), continuity, io, target).await {
-        let _ = app.on_event(ClientEvent::CutoverRollback {
-            restored: from_transport,
-            failed: target,
-            decision_id,
-            reason: err.to_string(),
-        });
-        emit_scheduler_state(
-            app.as_ref(),
-            SchedulerState::Recovering,
-            "cutover_guard_failed",
-        );
-        let _failed_io = std::mem::replace(io, old_io);
-        *transport = from_transport;
-        return Ok(None);
-    }
-
-    // Closing the old transport is loss-safe: anything not ACKed on it is redelivered via
-    // the resume cursor. Keeping a detached drain task would outlive client shutdown and
-    // could also ACK a later sequence while the new primary is still committing an earlier one.
-    drop(old_io);
-    emit_scheduler_state(
-        app.as_ref(),
-        SchedulerState::PrimaryActive,
-        "cutover_completed",
-    );
-    Ok(Some(candidate_welcome))
-}
-
-async fn cutover_guard(
-    config: &ClientConfig,
-    app: Arc<dyn ClientApp>,
-    continuity: &mut ClientContinuityState,
-    io: &mut ClientIo,
-    transport: TransportKind,
-) -> Result<(), WarpLinkError> {
-    if config.policy.cutover_guard_ms == 0 {
-        return Ok(());
-    }
-    let ping = config.wire_profile.encode_client_ping();
-    io.send_frame(&ping, config.policy.write_timeout_ms).await?;
-    let frame = io.recv_frame(config.policy.cutover_guard_ms).await?;
-    match config.wire_profile.decode_server_frame(&frame)? {
-        DecodedServerFrame::Deliver(msg) => {
-            let decision = dispatch_blocking_client_event(
-                app,
-                ClientEvent::Message {
-                    transport,
-                    msg: msg.clone(),
-                },
-            )
-            .await?;
-            let status = ack_status_for_decision(decision)?;
-            if let Some(status) = status {
-                let ack = AckMsg {
-                    seq: msg.seq,
-                    id: msg.id,
-                    status,
-                };
-                let bytes = config.wire_profile.encode_client_ack(&ack)?;
-                io.send_frame(&bytes, config.policy.write_timeout_ms)
-                    .await?;
-                continuity.note_acked_seq(msg.seq);
-            }
-            Ok(())
-        }
-        DecodedServerFrame::Ping => {
-            let pong = config.wire_profile.encode_client_pong();
-            io.send_frame(&pong, config.policy.write_timeout_ms).await?;
-            Ok(())
-        }
-        DecodedServerFrame::Pong | DecodedServerFrame::Unknown => Ok(()),
-        DecodedServerFrame::GoAway(reason) => Err(WarpLinkError::Protocol(format!(
-            "cutover guard goaway: {}",
-            reason.unwrap_or_else(|| "goaway".to_string())
-        ))),
-        DecodedServerFrame::Error { code, message } => Err(WarpLinkError::Protocol(format!(
-            "cutover guard gateway error: {code} {message}"
-        ))),
-        DecodedServerFrame::Welcome(_) => Err(WarpLinkError::Protocol(
-            "unexpected welcome during cutover guard".to_string(),
-        )),
-    }
 }
 
 struct ClientPowerRuntime {
@@ -2375,50 +2278,6 @@ async fn first_successful_probe(
 
     attempts.abort_all();
     None
-}
-
-async fn initialize_candidate_transport(
-    config: &ClientConfig,
-    app: &dyn ClientApp,
-    continuity: &ClientContinuityState,
-    power_runtime: &mut ClientPowerRuntime,
-    io: &mut ClientIo,
-) -> Result<warp_link_core::WelcomeMsg, WarpLinkError> {
-    let mut hello = build_effective_hello(config, app, power_runtime);
-    continuity.apply_to_hello(&mut hello);
-    let hello_frame = config.wire_profile.encode_client_hello(&hello)?;
-    io.send_frame(&hello_frame, config.policy.write_timeout_ms)
-        .await?;
-    let first = io.recv_frame(config.policy.connect_timeout_ms).await?;
-    let welcome = match config.wire_profile.decode_server_frame(&first)? {
-        DecodedServerFrame::Welcome(value) => value,
-        DecodedServerFrame::Error { code, message } => {
-            return Err(WarpLinkError::Protocol(format!(
-                "gateway error: {code} {message}"
-            )));
-        }
-        _ => {
-            return Err(WarpLinkError::Protocol(
-                "expected welcome frame from server".to_string(),
-            ));
-        }
-    };
-    validate_welcome_negotiation(&hello, &welcome)?;
-    let _ = app.on_event(ClientEvent::Connected {
-        transport: io_transport_kind(io),
-    });
-    let _ = app.on_event(ClientEvent::Welcome {
-        welcome: welcome.clone(),
-    });
-    Ok(welcome)
-}
-
-fn io_transport_kind(io: &ClientIo) -> TransportKind {
-    match io {
-        ClientIo::Quic { .. } => TransportKind::Quic,
-        ClientIo::Tcp { .. } => TransportKind::Tcp,
-        ClientIo::Wss { .. } => TransportKind::Wss,
-    }
 }
 
 async fn connect_transport(
@@ -2937,14 +2796,24 @@ pub async fn run_server_session(
                                         send_goaway_and_close(io, profile.as_ref(), &app, &session, reason).await;
                                         return Ok(());
                                     }
-                                    let state = app
-                                        .auth(AuthRequest {
-                                            phase: AuthCheckPhase::InBandReauth,
-                                            session: Some(session.clone()),
-                                            hello: Some(hello.clone()),
-                                            peer: None,
-                                        })
-                                        .await;
+                                    let authentication = app.auth(AuthRequest {
+                                        phase: AuthCheckPhase::InBandReauth,
+                                        session: Some(session.clone()),
+                                        hello: Some(hello.clone()),
+                                        peer: None,
+                                    });
+                                    let state = if hello.metadata.contains_key(warp_link_core::handoff::PHASE_KEY) {
+                                        match timeout(Duration::from_millis(config.hello_timeout_ms.max(1)), authentication).await {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                let error = WarpLinkError::Timeout("handoff authentication deadline".into());
+                                                app.on_disconnect(&session, DisconnectReason::ProtocolError(error.to_string())).await;
+                                                return Err(error);
+                                            }
+                                        }
+                                    } else {
+                                        authentication.await
+                                    };
                                     let state = match state {
                                         Ok(AuthResponse::State(state)) => state,
                                         Ok(AuthResponse::SessionUpdated(updated)) => {
@@ -2963,7 +2832,14 @@ pub async fn run_server_session(
                                             session = updated;
                                             session.max_frame_bytes = session.max_frame_bytes.clamp(2, TRANSPORT_MAX_FRAME_BYTES);
                                             auth_schedule = AuthSchedule::from_session(&session);
-                                            let receipt = profile.encode_server_welcome(&session_welcome(&session))?;
+                                            let receipt = match profile.encode_server_welcome(&session_welcome(&session)) {
+                                                Ok(receipt) => receipt,
+                                                Err(error) => {
+                                                    let error = WarpLinkError::Wire(error);
+                                                    app.on_disconnect(&session, DisconnectReason::ProtocolError(error.to_string())).await;
+                                                    return Err(error);
+                                                }
+                                            };
                                             if let Err(error) = io.send_frame(&receipt).await {
                                                 app.on_disconnect(&session, DisconnectReason::TransportError(error.to_string())).await;
                                                 return Err(error);
@@ -4484,6 +4360,55 @@ mod tests {
         state.note_acked_seq(Some(10));
         state.note_acked_seq(Some(7));
         assert_eq!(state.last_acked_seq, Some(10));
+    }
+
+    #[test]
+    fn hello_never_promotes_application_or_internal_maximum_into_cumulative_ack() {
+        let mut state = ClientContinuityState::default();
+        state.note_welcome(Some("exact-resume"));
+        state.note_acked_seq(Some(9));
+        let mut hello = super::HelloCtx {
+            last_acked_seq: Some(999),
+            metadata: [
+                (warp_link_core::handoff::PHASE_KEY.into(), "activate".into()),
+                (
+                    warp_link_core::handoff::PEER_KEY.into(),
+                    "stale-peer".into(),
+                ),
+                (
+                    warp_link_core::handoff::ID_KEY.into(),
+                    "stale-reservation".into(),
+                ),
+            ]
+            .into(),
+            ..super::HelloCtx::default()
+        };
+        state.apply_to_hello(&mut hello);
+        assert_eq!(hello.last_acked_seq, None);
+        assert_eq!(hello.resume_token.as_deref(), Some("exact-resume"));
+        assert_eq!(
+            hello
+                .metadata
+                .get(warp_link_core::handoff::VERSION_KEY)
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !hello
+                .metadata
+                .contains_key(warp_link_core::handoff::PHASE_KEY)
+        );
+        assert!(
+            !hello
+                .metadata
+                .contains_key(warp_link_core::handoff::PEER_KEY)
+        );
+        assert!(!hello.metadata.contains_key(warp_link_core::handoff::ID_KEY));
+        assert_eq!(
+            state.last_acked_seq,
+            Some(9),
+            "local observation does not become remote ACK authority"
+        );
     }
 
     #[test]
